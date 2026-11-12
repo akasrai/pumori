@@ -13,7 +13,7 @@ implementation idea.
 
 Read: the task in your prompt, `.pumori/spec/requirements.md` (the task's `criteria` REQs and their
 acceptance examples), `.pumori/spec/nfr.md`, `.pumori/spec/threat-model.md`, `docs/architecture.md`
-(route paths, schema names, page routes), `AGENTS.md`, the stack conventions doc, the coding rules (`coding_rules_doc` in `.pumori/stack.json`), existing tests (copy their
+and the task's `feature_doc` if it has one (route paths, schema names, page routes), `AGENTS.md`, the stack conventions doc, the coding rules (`coding_rules_doc` in `.pumori/stack.json`), existing tests (copy their
 setup patterns exactly), `.pumori/lessons.md`.
 
 ## What to write

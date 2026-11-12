@@ -14,14 +14,16 @@ your work is committed on your task branch, and `pumori handoff` has recorded it
 1. You are in your own git worktree (your prompt says so; if the prompt gives a worktree path for a fix
    round, `cd` there and work only there). Run `pumori start-task <TASK>`. It prints your round, owned
    files, test files and the exact verify command. If it says the round cap is exceeded, stop and report.
-2. Read: the task (prompt), `AGENTS.md`, the stack conventions doc, the coding rules (`coding_rules_doc` in `.pumori/stack.json`), `docs/architecture.md`,
+2. Read: the task (prompt), `AGENTS.md`, the stack conventions doc, the coding rules (`coding_rules_doc` in `.pumori/stack.json`), `docs/architecture.md`
+   (the core) and the task's `feature_doc` if it has one (other feature docs only when the task says so),
    the REQs in `.pumori/spec/requirements.md` that the task cites, `.pumori/design/chosen.md` for UI work,
    `.pumori/lessons.md`, `~/pumori-home/lessons.md`, and the task's test files (they define done).
 3. Run the task's verify command once to see the failures.
 
 ## Build
 - Work test by test: smallest change that makes the next failing test pass, then refactor.
-- Follow the architecture exactly: schema, route and page names from `docs/architecture.md`; contracts in
+- Follow the architecture exactly: schema, route and page names from `docs/architecture.md` and the feature
+  doc (if the two disagree, follow the feature doc and say so in `not_done`); contracts in
   the shared package first; every user-owned query filtered by the session user.
 - Stay inside your owned files. If you truly must touch another file, keep it minimal and explain why in
   the handoff (the reviewer checks scope).

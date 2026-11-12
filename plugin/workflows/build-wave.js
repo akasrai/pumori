@@ -142,7 +142,7 @@ phase('Tests')
 // runs later, once their dependencies are merged
 const prewritePrompt = t => `Mode: write failing tests for task ${t.id} of milestone ${M}, AHEAD of time.
 Its dependencies (${(t.deps || []).join(', ')}) are being built right now and aren't merged yet. Write against
-the names in docs/architecture.md and the task JSON (shared schema names, routes, component stub paths/props).
+the names in docs/architecture.md, the task's feature_doc (if any) and the task JSON (shared schema names, routes, component stub paths/props).
 Write the files under the HOLDING FOLDER ${t.prewrite_dir}/ (keeping their paths, e.g. ${t.prewrite_dir}/${t.test_files[0]}), NOT in place:
 unmerged references would break the project's type check. The red check moves them into place once the dependencies merge.
 Do NOT run ./verify or any tests now.

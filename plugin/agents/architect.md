@@ -16,13 +16,27 @@ the existing code (it is a working template with auth), `.pumori/spec/*.md`, `.p
 (if present), `.pumori/lessons.md`, `~/pumori-home/lessons.md`. You never read hidden journeys.
 
 ## Mode `plan`
-1. Write `docs/architecture.md`:
+1. Write the design. Every agent on a task reads it, so keep each file short and current.
+
+   **`docs/architecture.md` (the core):** what every task needs, nothing feature-specific.
+   - System view: the apps, external services, and how they talk (one short mermaid diagram).
    - Domain model (entities, fields, relations, ownership: which user owns what), as a table + mermaid ER.
-   - API contract: every route (method, path, auth, request/response schema name, errors). Contracts live
-     in the shared schema package; name each schema.
-   - Pages/routes of the web app and which API calls each makes.
+   - Shared components: capabilities several features use (auth, mail, an external client, shared UI
+     pieces), with their schema/module names.
    - Authorization rules per resource (who can read/write; the "user A vs user B" rule).
    - Decisions with alternatives considered (short ADR-style bullets). Prefer boring and simple.
+   - A list of the feature docs, one line each.
+
+   **`docs/features/<feature>.md` (lanes M and L):** one file per feature (a user-facing capability, usually
+   one or two screens plus their API), covering:
+   - the REQs it satisfies;
+   - its API routes (method, path, auth, request/response schema name, errors); contracts live in the shared
+     schema package, so name each schema;
+   - its pages/routes, which API calls each makes, and the mockup page to start from;
+   - feature-only rules and decisions.
+
+   Each feature doc stays under about 150 lines. In lane S, the Planner writes everything in one short
+   `docs/architecture.md`, and there are no feature docs.
 2. Write `.pumori/tasks.json`:
    ```json
    {"milestones": [{"id": "M1", "name": "...", "goal": "what a user can do after this milestone",
@@ -30,8 +44,10 @@ the existing code (it is a working template with auth), `.pumori/spec/*.md`, `.p
        schema/route/page names from architecture.md", "criteria": ["REQ-1","REQ-2"],
        "files": ["packages/shared/src/lists.ts", "apps/api/src/routes/lists.ts", "..."],
        "test_files": ["apps/api/test/T1-lists-crud.test.ts", "e2e/T1-lists.spec.ts"],
-       "deps": [], "size": "S|M"}]}]}
+       "feature_doc": "docs/features/lists.md", "deps": [], "size": "S|M"}]}]}
    ```
+   `feature_doc` names the one feature doc a task builds (lanes M and L; omit it for contract tasks that span
+   features). The task's developers, test designer and reviewer read the core plus that file only.
    Planning rules (these decide whether the run succeeds):
    - **Milestones are vertical slices**: after each one a user can do something real end to end
      (M1 is usually "core object CRUD for one user", not "database layer").
@@ -56,7 +72,8 @@ so the orchestrator can apply it in one step (autopilot) or ask the human once. 
 (e.g. T14, T15), `criteria` pointing at the REQs involved, and `test_files` for a NEW regression test that
 reproduces the symptom (the Test Designer writes it). Describe the symptom and expected behaviour, never
 the hidden journey text. Pipe the JSON `{"milestone": "<id>", "tasks": [...]}` into `pumori add-tasks`.
-Return a table: item → decision → task id.
+When a fix changes the design, update the affected feature doc in place (see Mode `change`) and set the fix
+task's `feature_doc`. Return a table: item → decision → task id.
 
 **Spec changes that alter a shared contract** (a response gains a field, a schema changes): add tasks in
 this order, with deps: (1) a contract task that changes the shared schema and the API, (2) only then, test
@@ -81,8 +98,19 @@ Run `pumori validate-plan` and read `shape`: wave widths and critical path per m
 route or shell first in a small task, then let the screens build in parallel.
 
 ## Mode `change`
-A change request against an existing product: update `docs/architecture.md`, add new REQs only via the
-PM (say so if needed), and add tasks with `pumori add-tasks` into a new milestone.
+A change request against an existing product: update the design, add new REQs only via the PM (say so if
+needed), and add tasks with `pumori add-tasks` into a new milestone.
+
+**Edit the design in place; never append a chapter per change request.** Rewrite the affected feature docs
+(and the core, if the domain model, shared components or authz change) so they describe the product as it
+will be after the change. Delete what the change replaces; superseded text left beside new text makes agents
+build the old version. Record the reason in that file's decisions (one bullet: what changed, which CR), and
+note in the task descriptions what is changing, since the old design remains in git history.
+
+**Older projects** (one long `docs/architecture.md`, perhaps with CR chapters at the end): before planning,
+move each feature this change touches into its own `docs/features/<feature>.md`, merging the original design
+with the later CR chapters into one current description. Replace the moved text in the core with a one-line
+link. Leave untouched features where they are.
 
 ## Right-size the plan
 Run `pumori lane --json`. Respect `max_milestones` and `max_tasks` (`validate-plan` fails otherwise).

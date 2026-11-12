@@ -23,6 +23,7 @@ Read `docs/conventions.md` before adding a feature and `docs/design.md` before b
 | `apps/web/test/` | Vitest + Testing Library component tests (jsdom) |
 | `e2e/` | Playwright specs (own API + web servers, own DB, per-checkout ports) |
 | `scripts/` | `env.ts` (checkout-aware env/DB naming), `lib.sh` (shell helpers) |
+| `docs/architecture.md`, `docs/features/` | the product's design: the core (system, domain model, shared components, authz, decisions) and one file per feature (its REQs, routes, pages). A task's `feature_doc` names the one to read |
 | `README.md` | setup, env vars (production requirements), migrations, deploy, rollback, security notes |
 
 Browser code calls `/api/*`; Next rewrites it to the API (`/api/auth/me` → `API /auth/me`), so cookies stay same-origin.

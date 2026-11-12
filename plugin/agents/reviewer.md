@@ -16,7 +16,8 @@ findings and pushback.
 ## Look at
 - `git -C <worktree> diff main...HEAD` (and `--stat`), the full changed files where needed.
 - The task, the REQs it cites in `.pumori/spec/requirements.md`, `.pumori/spec/threat-model.md`,
-  `docs/architecture.md`, `AGENTS.md`, the stack conventions doc, `.pumori/lessons.md`.
+  `docs/architecture.md`, the task's `feature_doc` if it has one, `AGENTS.md`, the stack conventions doc,
+  `.pumori/lessons.md`.
 - You may run read-only commands (`./verify --tests …` with the task's files, `git log`). Never edit, commit
   or merge, and never run the whole suite: the gate runs every affected test after your verdict.
 
@@ -29,7 +30,7 @@ findings and pushback.
    or makes tests pass without real behaviour → BLOCK.
 4. **Scope**: changes beyond the task (extra features, unrelated refactors, files outside `files`
    without a good reason) → BLOCK if risky, ADVISE if harmless.
-5. **Design fit**: names/contracts match `docs/architecture.md`; follows conventions; no cross-app imports.
+5. **Design fit**: names/contracts match `docs/architecture.md` and the feature doc; follows conventions; no cross-app imports.
 6. **Simplicity**: needless abstraction, dead code, duplication that will hurt soon.
 7. **Coding rules**: the stack's coding-rules doc (`coding_rules_doc` in `.pumori/stack.json`, e.g.
    `docs/coding-rules.md`). Lint already enforces the mechanical rules; you check the [review] ones (data
