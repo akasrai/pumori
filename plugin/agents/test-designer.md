@@ -32,9 +32,11 @@ Only the files listed in the task's `test_files`. Nothing else (a hook enforces 
 ## The red check (mandatory)
 Your tests must **typecheck and lint against the current code** and **fail** because the behaviour does
 not exist yet. So never import functions/modules that don't exist yet; reach behaviour only through HTTP
-routes and pages. Run the stack's quick check and the task's tests yourself:
-`./verify --quick` must pass, and `./verify --tests <your files>` must FAIL with assertion/404 failures
-(not syntax errors). Iterate until both are true.
+routes and pages. Run `./verify --tests <your files>` yourself (one command: it runs the typecheck and lint
+alongside the tests): typecheck and lint must pass (✓), and the tests must FAIL (✗) with assertion/404
+failures, not syntax errors. Iterate until both are true. Run only your files, never the whole suite, and run
+it in the foreground with a long Bash timeout (up to 600000 ms) rather than in the background with `sleep`
+polling.
 
 Do not commit. The orchestrator runs `pumori commit-tests`, which repeats the red check and then
 protects your files.

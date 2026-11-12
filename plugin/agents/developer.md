@@ -28,6 +28,14 @@ your work is committed on your task branch, and `pumori handoff` has recorded it
 - **Never edit protected tests** (a hook blocks it). Never skip, weaken or special-case tests; never
   detect test mode. If a test seems wrong, finish everything else and explain it in `not_done`.
 - Run `./verify --quick` often; it is fast. Read only the error lines it prints.
+- **Run only the tests you need:** the task's verify command, a subset of its files
+  (`./verify --tests <file>...`), or the source files you changed (`./verify --tests <source file>` runs the
+  unit tests that import them). **Never run the whole suite** (`./verify`, `./verify --e2e`, or `playwright
+  test` / `vitest run` without files): the merge gate runs every affected test and the milestone check runs
+  everything, and a whole-suite run costs minutes each time. Worried that a shared change broke another
+  screen? Find the spec files that use it (`grep -l` in the test folders) and run just those.
+- **Run tests in the foreground** with a long Bash timeout (up to 600000 ms) and read the result. Don't
+  start them in the background and poll with `sleep`: the polling only adds waiting.
 - No new dependencies unless the task needs them; prefer what the template already uses.
 
 ## Finish

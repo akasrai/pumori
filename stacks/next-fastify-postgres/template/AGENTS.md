@@ -33,8 +33,8 @@ Browser code calls `/api/*`; Next rewrites it to the API (`/api/auth/me` → `AP
 |---|---|
 | `./init.sh` / `./init.sh stop` / `./init.sh status` | install, create `.env` + dev DB, migrate, run api + web (logs `.run/*.log`); `--prod` = production web build |
 | `./verify --quick` | typecheck + lint/architecture rules. Run after every change |
-| `./verify --tests <file>...` | quick checks + only these tests (`e2e/*.spec.ts` → Playwright, `apps/*/test/*` → Vitest) |
-| `./verify` | full gate: typecheck → lint → unit → e2e → security. Must print `VERIFY PASS` before you are done |
+| `./verify --tests <file>...` | quick checks + only these tests (`e2e/*.spec.ts` → Playwright, `apps/*/test/*` → Vitest), all run in parallel. **The command for task work**; a source file runs the unit tests that import it |
+| `./verify` | full gate: typecheck → lint → unit → e2e → security. Run by the merge gate, the milestone check and release; don't run it (or `--e2e`) during a task, it takes minutes |
 | `./verify --e2e` / `./verify --security` | all Playwright tests / gitleaks + semgrep + `pnpm audit` |
 | `./verify --release` | full gate + `next build` + e2e against the production build (before a release) |
 | `corepack pnpm --filter @app/api db:generate --name <slug>` | create a migration after editing `schema.ts` |

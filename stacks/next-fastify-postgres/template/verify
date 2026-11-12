@@ -4,7 +4,7 @@
 #
 #   ./verify                     typecheck → lint/arch → unit tests → e2e → security (runs all steps)
 #   ./verify --quick             typecheck + lint/arch (stops at first failure)
-#   ./verify --tests <file>...   quick checks + only these tests (e2e/*.spec.ts → Playwright, rest → Vitest);
+#   ./verify --tests <file>...   typecheck + lint + only these tests, all in parallel (e2e/*.spec.ts → Playwright, rest → Vitest);
 #                                source files (apps/**, packages/**) run the unit tests that import them (vitest related)
 #   ./verify --e2e               all Playwright tests
 #   ./verify --security          gitleaks + semgrep + pnpm audit (prod, high)
@@ -90,6 +90,32 @@ run_step() {
   fi
   echo "✗ $name ($(elapsed "$start" "$end")s)"
   report_failure "$name" "$log" "$filter"
+  FAILED+=("$name")
+  return 1
+}
+
+# Parallel steps (used by --tests): start_step runs a step in the background, logging its exit status
+# and time; report_step waits for it and prints the same one line / filtered errors as run_step.
+# Reports are printed in a fixed order, so output reads the same as a sequential run.
+start_step() { # <name> <command...>
+  local name="$1"; shift
+  local log="$LOG_DIR/$name.log"
+  (
+    start="$(now)"; status=0
+    ( "$@" ) >"$log" 2>&1 || status=$?
+    printf '%s %s\n' "$status" "$(elapsed "$start" "$(now)")" >"$LOG_DIR/$name.status"
+  ) &
+  eval "STEP_PID_${name//-/_}=\$!"
+}
+report_step() { # <name> <filter>
+  local name="$1" filter="$2" status secs
+  local pid_var="STEP_PID_${name//-/_}"
+  wait "${!pid_var}" 2>/dev/null || true
+  read -r status secs <"$LOG_DIR/$name.status"
+  rm -f "$LOG_DIR/$name.status"
+  if [ "$status" -eq 0 ]; then echo "✓ $name (${secs}s)"; return 0; fi
+  echo "✗ $name (${secs}s)"
+  report_failure "$name" "$LOG_DIR/$name.log" "$filter"
   FAILED+=("$name")
   return 1
 }
@@ -209,10 +235,19 @@ case "$MODE" in
     run_step lint filter_eslint do_lint || stop_on_failure
     ;;
   tests)
-    run_step typecheck filter_tsc do_typecheck || stop_on_failure
-    run_step lint filter_eslint do_lint || stop_on_failure
-    if [ ${#VITEST_FILES[@]} -gt 0 ] || [ ${#RELATED_FILES[@]} -gt 0 ]; then run_step unit filter_vitest do_unit || stop_on_failure; fi
-    if [ ${#E2E_FILES[@]} -gt 0 ]; then run_step e2e filter_playwright do_e2e || stop_on_failure; fi
+    # Typecheck and lint run alongside the tests (the tests don't need them first: Node and Vitest strip
+    # types), so a run costs about as long as its slowest step instead of the sum of all of them.
+    HAS_UNIT=0; HAS_E2E=0
+    if [ ${#VITEST_FILES[@]} -gt 0 ] || [ ${#RELATED_FILES[@]} -gt 0 ]; then HAS_UNIT=1; fi
+    [ ${#E2E_FILES[@]} -eq 0 ] || HAS_E2E=1
+    start_step typecheck do_typecheck
+    start_step lint do_lint
+    [ "$HAS_UNIT" -eq 0 ] || start_step unit do_unit
+    [ "$HAS_E2E" -eq 0 ] || start_step e2e do_e2e
+    report_step typecheck filter_tsc || true
+    report_step lint filter_eslint || true
+    [ "$HAS_UNIT" -eq 0 ] || report_step unit filter_vitest || true
+    [ "$HAS_E2E" -eq 0 ] || report_step e2e filter_playwright || true
     ;;
   e2e)
     run_step e2e filter_playwright do_e2e || true

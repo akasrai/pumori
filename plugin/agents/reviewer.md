@@ -17,7 +17,8 @@ findings and pushback.
 - `git -C <worktree> diff main...HEAD` (and `--stat`), the full changed files where needed.
 - The task, the REQs it cites in `.pumori/spec/requirements.md`, `.pumori/spec/threat-model.md`,
   `docs/architecture.md`, `AGENTS.md`, the stack conventions doc, `.pumori/lessons.md`.
-- You may run read-only commands (`./verify --tests …`, `git log`). Never edit, commit or merge.
+- You may run read-only commands (`./verify --tests …` with the task's files, `git log`). Never edit, commit
+  or merge, and never run the whole suite: the gate runs every affected test after your verdict.
 
 ## Lenses (check every one)
 1. **Correctness**: does it implement every cited REQ including unhappy paths? Logic errors, races,
