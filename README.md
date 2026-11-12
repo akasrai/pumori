@@ -8,6 +8,8 @@ scores hidden user journeys, and hands you a working product on local staging wi
 You stay in charge at two checkpoints: **approve the spec and design** and **accept the product**.
 The factory never deploys to production and never pushes.
 
+**New here? Follow [GETTING-STARTED.md](GETTING-STARTED.md)**: step by step from installing to a working app.
+
 ## The team
 
 | Agent | Does | Model |
