@@ -38,6 +38,7 @@ tokens, and is the ONLY thing allowed to mark work as passing.
   pumori record test-review <task|baseline> < json   # reviewer verdict on a proposed protected-test change
   pumori amend-test <task|baseline> --reason R       # commit a reviewed change to protected tests
   pumori release [--dry-run]                 # final checks, staging if Docker runs, generated HANDOFF.md, commit
+  pumori trace [--json]                      # per requirement: tasks, tests, merge commits, journey results
   pumori boot [stop]                          # start/stop the app for QA (production build when the stack has one)
   pumori bench-setup <P1|P2|P3> <label>      # benchmark project with fixed journeys + autopilot
   pumori bench-score [--label L]
@@ -617,6 +618,17 @@ def cmd_validate_plan(a):
             if len(dependents) >= 4 and len(t.get("files", [])) >= 12:
                 concerns.append(f"{t['id']}: big foundation task ({len(t.get('files', []))} files) blocks {len(dependents)} tasks; "
                                 "split it so its dependents can start sooner")
+    # feature docs (lanes M and L): each task names the one design file its agents read, beside the core
+    for tid, t in tasks.items():
+        fd = t.get("feature_doc")
+        if fd and not (root / fd).is_file():
+            problems.append(f"{tid}: feature_doc {fd} does not exist (write it before planning tasks against it)")
+    if lane != "S":
+        unnamed = [tid for tid, t in tasks.items() if tid not in done_ids and not t.get("feature_doc")
+                   and t.get("area") != "contract"]
+        if unnamed:
+            concerns.append(f"{len(unnamed)} open task(s) have no feature_doc ({', '.join(unnamed[:8])}): "
+                            "name the docs/features/<feature>.md each one builds, so its agents read only that")
     protected_now = set(protected_tests(root))
     for tid, t in tasks.items():
         for f in t.get("amends_tests", []):
@@ -1136,6 +1148,7 @@ def cmd_start_task(a):
     log(root, f"{a.task} round {ts['rounds']} started on {branch}", "developer")
     print(json.dumps({"ok": True, "task": a.task, "round": ts["rounds"], "round_cap": cap, "branch": branch,
                       "worktree": str(here), "test_files": t["test_files"], "owned_files": t["files"],
+                      "design": ["docs/architecture.md"] + ([t["feature_doc"]] if t.get("feature_doc") else []),
                       "verify": stack_cfg(root)["commands"]["verify_tests"].replace(
                           "{files}", " ".join(t["test_files"]))}, indent=2))
 
@@ -1487,6 +1500,8 @@ def cmd_add_tasks(a):
         for k in ("id", "title", "description", "criteria", "files", "test_files", "deps"):
             if k not in t:
                 die(f"new task missing '{k}'")
+        if t.get("feature_doc") and not (root / t["feature_doc"]).is_file():
+            die(f"{t['id']}: feature_doc {t['feature_doc']} does not exist (write it first)")
         t.setdefault("origin", "fix")  # triage tasks don't count against the lane's planned-task cap
         target["tasks"].append(t)
     save_json(root / ".pumori" / "tasks.json", doc)
@@ -2019,6 +2034,94 @@ RISKY_RE = re.compile(r"auth|session|password|login|signup|permission|admin|migr
                       r"delete|payment|billing|money|invite|token|secret|env\.ts", re.I)
 
 
+def req_titles(root):
+    """REQ id -> its heading or line text from requirements.md (for reports)."""
+    path = root / ".pumori" / "spec" / "requirements.md"
+    titles = {}
+    if path.exists():
+        for line in path.read_text().splitlines():
+            m = re.match(r"^\s*(?:#+\s*|[-*]\s*|\*\*)?\**(REQ-\d+)\b\**[.:)\s-]*\**(.*)", line)
+            if m and m.group(1) not in titles:
+                titles[m.group(1)] = re.sub(r"[*`]", "", m.group(2)).strip()
+    return titles
+
+
+def req_trace(root):
+    """Per requirement: the tasks that built it, their tests and merge commits, and the hidden journeys that
+    exercised it. Everything comes from recorded state and git history; nothing is inferred."""
+    st = state(root)
+    tasks = all_tasks(root)
+    titles = req_titles(root)
+    reqs = sorted(active_reqs(root), key=lambda r: int(r.split("-")[1]))
+    merges, commits = {}, collections.Counter()
+    for line in git(["log", "--format=%h %P %s"], root).stdout.splitlines():
+        parts = line.split(" ")
+        sha, rest = parts[0], parts[1:]
+        parents = [x for x in rest if re.fullmatch(r"[0-9a-f]{7,40}", x)]
+        subject = " ".join(rest[len(parents):])
+        m = re.match(r"(?:merge |Merge )?(T\d+)[:, ]", subject)
+        if not m:
+            continue
+        if len(parents) > 1:
+            merges.setdefault(m.group(1), sha)
+        else:
+            commits[m.group(1)] += 1
+    by_req = collections.defaultdict(list)
+    for j in journeys(root):
+        for r in j["requires"]:
+            by_req[r].append(j["id"])
+    done = lambda tid: st["tasks"].get(tid, {}).get("status") in ("passed", "dropped")
+    rows = []
+    for r in reqs:
+        tids = [tid for tid, t in tasks.items() if r in t.get("criteria", [])]
+        tests = sorted({f for tid in tids for f in tasks[tid].get("test_files", [])})
+        js = []
+        for jid in sorted(by_req.get(r, [])):
+            jst = st["journeys"].get(jid, {})
+            js.append({"id": jid, "satisfied": bool(jst.get("satisfied")),
+                       "judged": bool(jst.get("votes")), "accepted_gap": bool(jst.get("accepted_gap"))})
+        # build status only: a journey spans many requirements, so its failure can't be pinned on one of them
+        status = "not covered" if not tids else ("built" if all(done(t) for t in tids) else "in progress")
+        rows.append({"req": r, "title": titles.get(r, ""), "status": status, "tasks": tids, "tests": tests,
+                     "commits": sum(commits[t] for t in tids),
+                     "merges": [merges[t] for t in tids if t in merges], "journeys": js})
+    return rows
+
+
+def trace_markdown(rows):
+    counts = collections.Counter(r["status"] for r in rows)
+    judged = lambda r: [j for j in r["journeys"] if j["judged"]]
+    j_ok = sum(1 for r in rows if judged(r) and all(j["satisfied"] for j in judged(r)))
+    j_bad = sum(1 for r in rows if any(not j["satisfied"] for j in judged(r)))
+    j_none = sum(1 for r in rows if not judged(r))
+    L = [f"## Requirements trace ({len(rows)})", "",
+         "- Built: " + " · ".join(f"{counts[k]} {k}" for k in ("built", "in progress", "not covered") if counts[k]),
+         f"- Journeys: {j_ok} only in satisfied journeys · {j_bad} in at least one unsatisfied journey · "
+         f"{j_none} not exercised by any journey", "",
+         "Each requirement, the tasks that built it, their tests and merge commits, and the hidden user journeys "
+         "that exercised it (✓ satisfied, ✗ not satisfied, ✗* accepted as a known gap, … not judged yet). A journey "
+         "covers several requirements, so ✗ means the journey as a whole failed, not necessarily this requirement.", "",
+         "| REQ | Requirement | Status | Tasks | Tests | Merged in | Journeys |", "|---|---|---|---|---|---|---|"]
+    for r in rows:
+        title = (r["title"][:60] + "…") if len(r["title"]) > 61 else r["title"]
+        status = f"**{r['status']}**" if r["status"] == "not covered" else r["status"]
+        mark = lambda j: "✓" if j["satisfied"] else ("…" if not j["judged"] else ("✗*" if j["accepted_gap"] else "✗"))
+        js = ", ".join(f"{j['id']} {mark(j)}" for j in r["journeys"]) or "–"
+        merged = ", ".join(f"`{m}`" for m in r["merges"][:4]) + (" …" if len(r["merges"]) > 4 else "") or "–"
+        L.append(f"| {r['req']} | {title.replace('|', '/')} | {status} | {', '.join(r['tasks']) or '–'} | "
+                 f"{len(r['tests'])} | {merged} | {js} |")
+    return L
+
+
+def cmd_trace(a):
+    root = repo_root()
+    rows = req_trace(root)
+    if a.json:
+        print(json.dumps(rows, indent=2))
+    else:
+        print("\n".join(trace_markdown(rows)))
+
+
 def cmd_release(a):
     """Release without an agent: every fact in the handoff comes from recorded run state, so nothing is invented."""
     root = repo_root()
@@ -2041,8 +2144,6 @@ def cmd_release(a):
     ports = cfg.get("ports", {})
     fmt = lambda u: u.format(**{**ports, "STAGING_WEB_PORT": int(ports.get("WEB_PORT", 0) or 0) + 1000})
     urls = {k: fmt(v) for k, v in stack.get("urls", {}).items()} if ports else {}
-    reqs = sorted(active_reqs(root), key=lambda r: int(r.split("-")[1]))
-    cover = {r: [tid for tid, t in tasks.items() if r in t.get("criteria", [])] for r in reqs}
     js = journeys(root)
     qa_files = sorted(glob.glob(str(rt(root) / "qa" / "*" / "cycle-*.json")))
     gaps = []
@@ -2068,8 +2169,7 @@ def cmd_release(a):
     for tid, t in tasks.items():
         ts = st["tasks"].get(tid, {})
         L.append(f"| {tid} | {t.get('area', '')} | {t['title']} | {ts.get('rounds', 0)} ({ts.get('status', 'todo')}) |")
-    L += ["", f"## Requirements ({len(reqs)})", ""]
-    L += [f"- {r}: " + (", ".join(cover[r]) if cover[r] else "**not covered**") for r in reqs]
+    L += [""] + trace_markdown(req_trace(root))
     L += ["", "## Verification", ""]
     for name, ok, tail in checks:
         L.append(f"- {name}: **{'PASS' if ok else 'FAIL'}**")
@@ -2336,6 +2436,7 @@ def main():
     s = sub.add_parser("resolve"); s.add_argument("task"); s.add_argument("action", choices=["retry", "drop", "merged"]); s.add_argument("--note", default="")
     s = sub.add_parser("amend-test"); s.add_argument("target"); s.add_argument("--reason", required=True)
     s = sub.add_parser("release"); s.add_argument("--dry-run", action="store_true")
+    s = sub.add_parser("trace"); s.add_argument("--json", action="store_true")
     s = sub.add_parser("boot"); s.add_argument("action", nargs="?", default="start", choices=["start", "stop"])
     s = sub.add_parser("event"); s.add_argument("role"); s.add_argument("msg", nargs="+")
     s = sub.add_parser("roster"); s.add_argument("action", nargs="?", default="show", choices=["show", "set", "clear"])
@@ -2350,7 +2451,7 @@ def main():
           "handoff": cmd_handoff, "record": cmd_record, "gate": cmd_gate, "add-tasks": cmd_add_tasks,
           "journeys": cmd_journeys, "milestone-close": cmd_milestone_close, "milestone-accept": cmd_milestone_accept, "clean-dbs": cmd_clean_dbs, "cost": cmd_cost, "brand": cmd_brand, "flaky": cmd_flaky, "ready": cmd_ready, "qa-mark": cmd_qa_mark, "budget": cmd_budget,
           "status": cmd_status, "log": cmd_log, "event": cmd_event, "task": cmd_task, "lane": cmd_lane, "check-spec": cmd_check_spec,
-          "milestone-check": cmd_milestone_check, "resolve": cmd_resolve, "amend-test": cmd_amend_test, "boot": cmd_boot, "release": cmd_release, "roster": cmd_roster, "bench-score": cmd_bench_score, "bench-setup": cmd_bench_setup,
+          "milestone-check": cmd_milestone_check, "resolve": cmd_resolve, "amend-test": cmd_amend_test, "boot": cmd_boot, "release": cmd_release, "trace": cmd_trace, "roster": cmd_roster, "bench-score": cmd_bench_score, "bench-setup": cmd_bench_setup,
           "hook": cmd_hook}[a.cmd]
     fn(a)
 
