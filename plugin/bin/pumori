@@ -1,0 +1,2359 @@
+#!/usr/bin/env python3
+"""pumori: the deterministic core of the Pumori software factory.
+
+Agents do the thinking; this program owns the truth. It keeps the run state, decides what
+happens next, runs the gates (review verdict, test guard, merge, verify), counts rounds and
+tokens, and is the ONLY thing allowed to mark work as passing.
+
+  pumori new <name> --prd FILE [--stack NAME] [--dir DIR] [--budget UNITS]
+  pumori adopt [--stack-file FILE]            # existing repo: create .pumori/ here
+  pumori next [--json]                        # what the orchestrator should do now
+  pumori stage <name>                         # advance the pre-build stages
+  pumori validate-plan [--json]               # readiness gate for .pumori/tasks.json
+  pumori commit-docs -m MSG                   # commit spec/plan docs on main
+  pumori commit-tests <milestone>             # red-check + commit + protect task tests
+  pumori start-task <task>                    # (developer, in its worktree) register a round
+  pumori handoff <task>   < json              # (developer) record handoff; CLI runs verify
+  pumori record review <task> < json          # (reviewer) verdict, pinned to branch head sha
+  pumori record qa <milestone> < json         # (QA) milestone report
+  pumori record judge <journey> < json        # (judge) one vote
+  pumori record conductor <task> < json       # (conductor) decision
+  pumori gate <task>                          # test guard + merge + verify + mark passed
+  pumori add-tasks < json                     # bug/change tasks from triage
+  pumori journeys [--ready] [--json]          # hidden journey ids (never their content)
+  pumori milestone-close <milestone>
+  pumori qa-mark start|end <milestone>
+  pumori milestone-accept <m> --reason "..."  # human decision only: close with QA/journey gaps as known gaps
+  pumori clean-dbs [--all]                    # drop leftover test DBs (never the app/template/staging DB)
+  pumori budget [--json]
+  pumori status [--json] [--html]
+  pumori log MSG
+  pumori task <task>                          # task definition + state (branch, worktree, rounds, review)
+  pumori event <role> MSG                     # role-tagged timeline entry (who did what)
+  pumori roster [set <role> <session_id> [--title T] | clear <role>]   # role sessions (sessions mode)
+  pumori lane [S|M|L] [--json]               # size lane of this run (auto from PRD size) and its limits
+  pumori check-spec [--json]                  # requirement count vs the lane's budget (PM runs it)
+  pumori milestone-check <milestone>          # browser (e2e) suite of a built milestone; reopens failing tasks
+  pumori resolve <task> retry|drop [--note N] # human/orchestrator way out of an escalation
+  pumori record test-review <task|baseline> < json   # reviewer verdict on a proposed protected-test change
+  pumori amend-test <task|baseline> --reason R       # commit a reviewed change to protected tests
+  pumori release [--dry-run]                 # final checks, staging if Docker runs, generated HANDOFF.md, commit
+  pumori boot [stop]                          # start/stop the app for QA (production build when the stack has one)
+  pumori bench-setup <P1|P2|P3> <label>      # benchmark project with fixed journeys + autopilot
+  pumori bench-score [--label L]
+  pumori hook <pretool|subagent-stop>         # Claude Code hook entry points (stdin JSON)
+"""
+import argparse, collections, datetime as dt, fcntl, fnmatch, glob, hashlib, html, json, os, pathlib, re
+import shutil, socket, subprocess, sys, time
+
+PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[1]
+HOME = pathlib.Path(os.environ.get("PUMORI_HOME", pathlib.Path.home() / "pumori-home"))
+PROJECTS = pathlib.Path(os.environ.get("PUMORI_PROJECTS", pathlib.Path.home() / "pumori-projects"))
+DEFAULTS = {"max_rounds": 3, "max_qa_cycles": 2, "max_parallel": 3, "judge_votes": 3,
+            "budget_units": 60_000_000, "default_stack": "next-fastify-postgres"}
+STAGES = ["intake", "questions", "spec", "challenge", "design", "approval", "plan", "build",
+          "release", "accept", "done"]
+DOC_PATHS = [".pumori", "docs", "AGENTS.md", "CLAUDE.md"]
+# Adaptive lanes: the process scales with the PRD. Small products must not pay for big-product ceremony.
+LANES = {
+    "S": {"max_reqs": 15, "max_milestones": 1, "max_tasks": 5, "tests_per_task": 8, "questions": 3, "max_parallel": 3,
+          "design_variants": 0, "challenge": False, "e2e_at_gate": False, "review_effort": "medium",
+          "nfr": "reasonable defaults only; no extra security/perf features unless the PRD asks",
+          "target_minutes": 20},
+    "M": {"max_reqs": 40, "max_milestones": 3, "max_tasks": 20, "tests_per_task": 12, "questions": 6, "max_parallel": 4,
+          "design_variants": 1, "challenge": True, "e2e_at_gate": False, "review_effort": "high",
+          "nfr": "explicit budgets for the PRD's real risks", "target_minutes": 90},
+    "L": {"max_reqs": 120, "max_milestones": 6, "max_tasks": 80, "tests_per_task": 15, "questions": 10, "max_parallel": 6,
+          "design_variants": 2, "challenge": True, "e2e_at_gate": True, "review_effort": "high",
+          "nfr": "full NFRs and threat model", "target_minutes": 480},
+}
+
+
+def size_prd(text):
+    words = len(re.findall(r"\w+", text))
+    bullets = len(re.findall(r"^\s*([-*]|\d+\.)\s+", text, re.M))
+    if words <= 150 and bullets <= 12:
+        return "S"
+    if words > 1000 or bullets > 40:
+        return "L"
+    return "M"
+
+
+DEV_ROLES = {"pumori:developer", "pumori:backend-dev", "pumori:frontend-dev"}
+
+
+def dev_agent_for(root, task):
+    """Which developer builds a task. Contract and full-stack tasks go to the generalist (no area fence);
+    backend-only and frontend-only tasks go to the specialists."""
+    area = task.get("area")
+    areas = stack_cfg(root).get("areas", {})
+    if not area and areas:
+        def in_area(f, name):
+            return globs_match(f, areas.get(name, {}).get("paths", []))
+        files = task.get("files", [])
+        if files and all(in_area(f, "contract") for f in files):
+            area = "contract"
+        elif files and all(in_area(f, "frontend") for f in files):
+            area = "frontend"
+        elif files and all(in_area(f, "backend") or in_area(f, "contract") for f in files):
+            area = "backend"
+        else:
+            area = "fullstack"
+    return {"frontend": "pumori:frontend-dev", "backend": "pumori:backend-dev"}.get(area or "", "pumori:developer"), area or "fullstack"
+
+
+FRONTEND_RISKY_RE = re.compile(r"auth|login|signup|session|password|permission|admin|middleware|proxy|token|"
+                               r"secret|env|next\.config|instrumentation", re.I)
+
+
+def review_model(task, area):
+    """Risk-based review. Opus for contracts, backend and full-stack tasks (data, money rules, authorization
+    live there) and for frontend tasks whose files touch auth, sessions, permissions, proxying or config.
+    Sonnet for other frontend work: the server already enforces the rules, and the gate's tests still run."""
+    if area in ("contract", "backend", "fullstack"):
+        return "opus"
+    return "opus" if any(FRONTEND_RISKY_RE.search(f) for f in task.get("files", [])) else "sonnet"
+
+
+def max_parallel(root):
+    explicit = load_json(root / ".pumori" / "run.json", {}).get("limits", {}).get("max_parallel")
+    return int(explicit or lane_of(root)[1].get("max_parallel", DEFAULTS["max_parallel"]))
+
+
+def lane_of(root):
+    cfg = load_json(root / ".pumori" / "run.json", {})
+    lane = cfg.get("lane") or size_prd((root / ".pumori" / "prd.md").read_text() if (root / ".pumori" / "prd.md").exists() else "")
+    return lane, {**LANES[lane], **cfg.get("lane_overrides", {})}
+ROLE_PREFIX = "pumori:"
+
+
+# ---------- small helpers ----------
+def now():
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def die(msg, code=1, as_json=False):
+    if as_json:
+        print(json.dumps({"ok": False, "error": msg}))
+    else:
+        print(f"pumori: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def run(cmd, cwd=None, check=False, env=None, timeout=None):
+    p = subprocess.run(cmd, cwd=cwd, shell=isinstance(cmd, str), text=True, capture_output=True,
+                       env=env, timeout=timeout)
+    if check and p.returncode != 0:
+        die(f"command failed: {cmd}\n{p.stdout}\n{p.stderr}")
+    return p
+
+
+def git(args, cwd, check=False):
+    return run(["git", *args], cwd=cwd, check=check)
+
+
+def stacks_dirs():
+    out = []
+    if os.environ.get("PUMORI_STACKS"):
+        out.append(pathlib.Path(os.environ["PUMORI_STACKS"]))
+    out += [PLUGIN_ROOT / "stacks", PLUGIN_ROOT.parent / "stacks"]
+    return [d for d in out if d.is_dir()]
+
+
+def find_stack(name):
+    for d in stacks_dirs():
+        if (d / name / "stack.json").exists():
+            return d / name
+    die(f"stack '{name}' not found in {[str(d) for d in stacks_dirs()]}")
+
+
+def repo_root(start=None):
+    """Main checkout root, even when called from a git worktree."""
+    start = start or os.getcwd()
+    p = git(["rev-parse", "--path-format=absolute", "--git-common-dir"], start)
+    if p.returncode != 0:
+        die("not inside a git repository")
+    common = pathlib.Path(p.stdout.strip())
+    root = common.parent if common.name == ".git" else pathlib.Path(git(["rev-parse", "--show-toplevel"], start).stdout.strip())
+    if not (root / ".pumori" / "run.json").exists():
+        die(f"{root} is not a Pumori project (no .pumori/run.json). Use `pumori new` or `pumori adopt`.")
+    return root
+
+
+def checkout_root(start=None):
+    return pathlib.Path(git(["rev-parse", "--show-toplevel"], start or os.getcwd()).stdout.strip())
+
+
+def rt(root):
+    d = root / ".pumori" / "runtime"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def load_json(path, default=None):
+    try:
+        return json.loads(pathlib.Path(path).read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def save_json(path, data):
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(path)
+
+
+class Locked:
+    """Serialises every state mutation and every merge into main. Re-entrant within one process
+    (a milestone check holds it while it updates state)."""
+    depth = 0
+    f = None
+
+    def __init__(self, root):
+        self.root = root
+
+    def __enter__(self):
+        if Locked.depth == 0:
+            Locked.f = open(rt(self.root) / "lock", "w")
+            fcntl.flock(Locked.f, fcntl.LOCK_EX)
+        Locked.depth += 1
+        return self
+
+    def __exit__(self, *a):
+        Locked.depth -= 1
+        if Locked.depth == 0:
+            fcntl.flock(Locked.f, fcntl.LOCK_UN)
+            Locked.f.close()
+            Locked.f = None
+
+
+def run_cfg(root):
+    cfg = load_json(root / ".pumori" / "run.json", {})
+    return {**DEFAULTS, **cfg.get("limits", {}), **cfg}
+
+
+def stack_cfg(root):
+    s = load_json(root / ".pumori" / "stack.json")
+    if not s:
+        die("missing .pumori/stack.json")
+    return s
+
+
+def state(root):
+    return load_json(rt(root) / "state.json", {"stage": "intake", "tasks": {}, "milestones": {},
+                                               "journeys": {}, "sessions": [], "events": 0})
+
+
+def save_state(root, st):
+    save_json(rt(root) / "state.json", st)
+
+
+def tasks_doc(root):
+    return load_json(root / ".pumori" / "tasks.json", {"milestones": []})
+
+
+def all_tasks(root):
+    out = {}
+    for m in tasks_doc(root).get("milestones", []):
+        for t in m.get("tasks", []):
+            out[t["id"]] = {**t, "milestone": m["id"]}
+    return out
+
+
+def log(root, msg, role="pumori"):
+    t = now()
+    with open(rt(root) / "progress.log", "a") as f:
+        f.write(f"{t}  [{role}] {msg}\n")
+    with open(rt(root) / "events.jsonl", "a") as f:
+        f.write(json.dumps({"at": t, "role": role, "msg": msg}) + "\n")
+
+
+def stack_env(root):
+    env = dict(os.environ)
+    pre = stack_cfg(root).get("runtime", {}).get("path_prepend", [])
+    env["PATH"] = os.pathsep.join([p for p in pre if os.path.isdir(p)] + [env.get("PATH", "")])
+    return env
+
+
+def run_stack(root, key, cwd, files=None, timeout=1800):
+    cmd = stack_cfg(root)["commands"][key]
+    if files is not None:
+        cmd = cmd.replace("{files}", " ".join(f"'{f}'" for f in files))
+    t0 = time.time()
+    p = run(cmd, cwd=cwd, env=stack_env(root), timeout=timeout)
+    out = (p.stdout + ("\n" + p.stderr if p.stderr.strip() else "")).strip()
+    lines = out.splitlines()
+    return {"ok": p.returncode == 0, "seconds": round(time.time() - t0, 1),
+            "output": "\n".join(lines[-80:])}
+
+
+def globs_match(path, globs):
+    return any(fnmatch.fnmatch(path, g) or fnmatch.fnmatch(path, g.rstrip("/") + "/*") for g in globs)
+
+
+def frontmatter(text):
+    m = re.match(r"^---\n(.*?)\n---\n", text, re.S)
+    meta = {}
+    if m:
+        for line in m.group(1).splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                v = v.strip()
+                if v.startswith("[") and v.endswith("]"):
+                    v = [x.strip().strip("'\"") for x in v[1:-1].split(",") if x.strip()]
+                meta[k.strip()] = v
+    return meta
+
+
+def scenarios_dir(root):
+    return HOME / "scenarios" / run_cfg(root)["project"]
+
+
+STDIN_WAIT_S = 10
+
+
+def read_stdin_json():
+    """JSON from stdin. Never waits forever: P3 v03 lost 25 min to `pumori handoff T5` run with no input,
+    blocked on an inherited stdin that never closed."""
+    hint = ("this command reads JSON on stdin, e.g. pumori " + " ".join(sys.argv[1:4]) +
+            " <<'EOF'\n{...}\nEOF")
+    if sys.stdin is None or sys.stdin.closed or sys.stdin.isatty():
+        die("no JSON on stdin; " + hint)
+    import select
+    try:
+        ready, _, _ = select.select([sys.stdin], [], [], STDIN_WAIT_S)
+    except (OSError, ValueError):
+        ready = [sys.stdin]
+    if not ready:
+        die(f"no JSON arrived on stdin within {STDIN_WAIT_S}s; " + hint)
+    raw = sys.stdin.read()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        die(f"stdin is not valid JSON: {e}")
+
+
+def out(data, as_json):
+    if as_json:
+        print(json.dumps(data, indent=2))
+    else:
+        for k, v in data.items():
+            print(f"{k}: {v if not isinstance(v, (dict, list)) else json.dumps(v)}")
+
+
+# ---------- project creation ----------
+def free_port(start):
+    for port in range(start, start + 400):
+        with socket.socket() as s:
+            if s.connect_ex(("127.0.0.1", port)) != 0 and s.connect_ex(("127.0.0.1", port + 1000)) != 0:
+                return port
+    die("no free port found")
+
+
+def cmd_new(a):
+    name = re.sub(r"[^a-z0-9-]", "-", a.name.lower()).strip("-")
+    stack_dir = find_stack(a.stack)
+    dest = pathlib.Path(a.dir).expanduser().resolve() if a.dir else PROJECTS / name
+    if dest.exists() and any(dest.iterdir()):
+        die(f"{dest} already exists and is not empty")
+    shutil.copytree(stack_dir / "template", dest, dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns("node_modules", ".next", ".run", ".verify", "test-results",
+                                                  "playwright-report", ".env"))
+    h = int(hashlib.sha1(name.encode()).hexdigest(), 16)
+    subs = {"PROJECT": name, "DB_NAME": "pumori_" + name.replace("-", "_"),
+            "API_PORT": str(free_port(4600 + h % 400)), "WEB_PORT": str(free_port(3100 + h % 400))}
+    # web 3100-3499, staging web (+1000) 4100-4499, api 4600-4999, staging api (+1000) 5600-5999: no overlaps
+    ex = dest / ".env.example"
+    if ex.exists():
+        text = ex.read_text()
+        for k, v in subs.items():
+            text = text.replace("{{" + k + "}}", v)
+        text = text.replace("postgres://DB_USER@", f"postgres://{os.environ.get('USER', 'postgres')}@")
+        (dest / ".env").write_text(text)
+    subs["APP_NAME"] = " ".join(w.capitalize() for w in name.split("-"))
+    for rel in load_json(stack_dir / "stack.json", {}).get("placeholder_files", []):  # e.g. the product name
+        f = dest / rel
+        if f.exists():
+            text = f.read_text()
+            for k, v in subs.items():
+                text = text.replace("{{" + k + "}}", v)
+            f.write_text(text)
+    (dest / ".pumori" / "spec").mkdir(parents=True, exist_ok=True)
+    (dest / ".pumori" / "design").mkdir(parents=True, exist_ok=True)
+    shutil.copy(stack_dir / "stack.json", dest / ".pumori" / "stack.json")
+    prd = pathlib.Path(a.prd).expanduser()
+    if not prd.exists():
+        die(f"PRD not found: {prd}")
+    shutil.copy(prd, dest / ".pumori" / "prd.md")
+    save_json(dest / ".pumori" / "run.json", {
+        "project": name, "stack": a.stack, "created_at": now(), "kind": "new",
+        "lane": size_prd(prd.read_text()),
+        "ports": subs, "limits": {"budget_units": a.budget or DEFAULTS["budget_units"]}})
+    brand = apply_brand(dest, stack_dir, a.brand) if a.brand else None
+    if brand:
+        rc = load_json(dest / ".pumori" / "run.json", {})
+        rc["brand"] = brand["brand"]
+        save_json(dest / ".pumori" / "run.json", rc)
+    (dest / ".pumori" / "lessons.md").write_text("# Lessons\n\nRules learned during this run. Every agent reads this.\n")
+    gi = dest / ".gitignore"
+    gi.write_text((gi.read_text() if gi.exists() else "") + "\n.pumori/runtime/\n.claude/worktrees/\n")
+    git(["init", "-b", "main"], dest, check=True)
+    git(["add", "-A"], dest, check=True)
+    git(["-c", "user.name=Pumori", "-c", "user.email=pumori@localhost", "commit", "-qm",
+         f"chore: scaffold {name} from {a.stack}"], dest, check=True)
+    scen = HOME / "scenarios" / name
+    scen.mkdir(parents=True, exist_ok=True)
+    root = dest
+    st = state(root)
+    st["started_at"] = now()
+    save_state(root, st)
+    log(root, f"project created from stack {a.stack}")
+    print(json.dumps({"ok": True, "project": name, "dir": str(dest), "scenarios": str(scen), "brand": brand["brand"] if brand else "default", **subs}, indent=2))
+
+
+# ---------- brands ----------
+def find_brand(name):
+    """A brand is a folder with brand.json, theme.css, and optionally fonts/ and logo.svg.
+    Looked up by name in $PUMORI_HOME/brands/<name>, or given as a path."""
+    p = pathlib.Path(name).expanduser()
+    for cand in (p, HOME / "brands" / name):
+        if (cand / "brand.json").exists():
+            return cand.resolve()
+    die(f"brand not found: {name} (looked in {HOME / 'brands'}; a brand folder needs brand.json)")
+
+
+def apply_brand(dest, stack_dir, name):
+    bdir = find_brand(name)
+    meta = load_json(bdir / "brand.json", {})
+    targets = load_json(stack_dir / "stack.json", {}).get("brand_targets", {})
+    if not targets:
+        die("this stack has no brand_targets in stack.json")
+    done = []
+    theme = bdir / meta.get("theme", "theme.css")
+    if theme.exists() and targets.get("theme"):
+        shutil.copy(theme, dest / targets["theme"])
+        done.append("theme")
+    fonts = bdir / meta.get("fonts", "fonts")
+    if fonts.is_dir() and targets.get("fonts"):
+        tgt = dest / targets["fonts"]
+        shutil.rmtree(tgt, ignore_errors=True)
+        shutil.copytree(fonts, tgt)
+        done.append("fonts")
+    logo = bdir / meta.get("logo", "logo.svg")
+    if logo.exists() and targets.get("logo"):
+        tgt = dest / targets["logo"]
+        tgt.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(logo, tgt)
+        done.append("logo")
+    return {"brand": meta.get("name", bdir.name), "source": str(bdir), "applied": done,
+            "logo": targets.get("logo") if "logo" in done else None}
+
+
+def cmd_brand(a):
+    if a.action == "list":
+        rows = []
+        for b in sorted((HOME / "brands").glob("*/brand.json")):
+            m = load_json(b, {})
+            rows.append({"name": b.parent.name, "title": m.get("name", ""), "description": m.get("description", "")})
+        print(json.dumps(rows, indent=2))
+        return
+    if not a.name:
+        die("usage: pumori brand apply <name|path>")
+    root = repo_root()
+    run_cfg = load_json(root / ".pumori" / "run.json", {})
+    res = apply_brand(root, find_stack(run_cfg.get("stack", DEFAULTS["default_stack"])), a.name)
+    run_cfg["brand"] = res["brand"]
+    save_json(root / ".pumori" / "run.json", run_cfg)
+    log(root, f"brand applied: {res['brand']} ({', '.join(res['applied'])})")
+    print(json.dumps({"ok": True, **res}, indent=2))
+
+
+def cmd_adopt(a):
+    root = checkout_root()
+    name = re.sub(r"[^a-z0-9-]", "-", root.name.lower())
+    (root / ".pumori").mkdir(exist_ok=True)
+    if a.stack_file:
+        shutil.copy(a.stack_file, root / ".pumori" / "stack.json")
+    if not (root / ".pumori" / "run.json").exists():
+        save_json(root / ".pumori" / "run.json", {"project": name, "stack": "adopted", "created_at": now(),
+                                                    "kind": "existing", "limits": {}})
+    gi = root / ".gitignore"
+    text = gi.read_text() if gi.exists() else ""
+    if ".pumori/runtime/" not in text:
+        gi.write_text(text + "\n.pumori/runtime/\n.claude/worktrees/\n")
+    (HOME / "scenarios" / name).mkdir(parents=True, exist_ok=True)
+    st = state(root)
+    st.setdefault("started_at", now())
+    save_state(root, st)
+    print(json.dumps({"ok": True, "project": name, "dir": str(root),
+                      "needs_stack_json": not (root / ".pumori" / "stack.json").exists()}))
+
+
+# ---------- plan validation (readiness gate) ----------
+REQ_RE = re.compile(r"\b(REQ-\d+)\b")
+REMOVED_RE = re.compile(r"~~|\(removed|removed\)|\[removed|withdrawn|deleted in CR", re.I)
+
+
+def active_reqs(root):
+    """REQ ids defined in requirements.md, ignoring ones marked removed/struck through."""
+    path = root / ".pumori" / "spec" / "requirements.md"
+    if not path.exists():
+        return set()
+    out = set()
+    for line in path.read_text().splitlines():
+        m = re.match(r"^\s*(?:#+\s*|[-*]\s*|\*\*)?\**(REQ-\d+)\b", line)
+        if m and not REMOVED_RE.search(line):
+            out.add(m.group(1))
+    if not out:  # free-form spec: fall back to every mention
+        out = set(REQ_RE.findall(path.read_text()))
+    return out
+
+
+def cmd_validate_plan(a):
+    root = repo_root()
+    doc = tasks_doc(root)
+    stack = stack_cfg(root)
+    problems, concerns = [], []
+    reqs = active_reqs(root)
+    lane, prof = lane_of(root)
+    if not reqs:
+        problems.append("no REQ-n ids found in .pumori/spec/requirements.md")
+    ids, covered, test_owner = set(), set(), {}
+    ms = doc.get("milestones", [])
+    if not ms:
+        problems.append("tasks.json has no milestones")
+    for m in ms:
+        for k in ("id", "name", "goal", "tasks"):
+            if k not in m:
+                problems.append(f"milestone missing '{k}': {m.get('id')}")
+        for t in m.get("tasks", []):
+            for k in ("id", "title", "description", "criteria", "files", "test_files", "deps"):
+                if k not in t:
+                    problems.append(f"{t.get('id')}: missing '{k}'")
+            if t.get("id") in ids:
+                problems.append(f"duplicate task id {t['id']}")
+            ids.add(t.get("id"))
+            covered.update(t.get("criteria", []))
+            if not t.get("test_files"):
+                problems.append(f"{t.get('id')}: no test_files (every task needs failing tests first)")
+            for f in t.get("test_files", []):
+                if f in test_owner:
+                    problems.append(f"test file {f} owned by both {test_owner[f]} and {t['id']}")
+                test_owner[f] = t["id"]
+                if not globs_match(f, stack.get("test_globs", [])):
+                    problems.append(f"{t['id']}: test file {f} is outside the stack's test_globs")
+            if len(t.get("description", "")) < 40:
+                concerns.append(f"{t.get('id')}: description is very short")
+    tasks = all_tasks(root)
+    for tid, t in tasks.items():
+        for d in t.get("deps", []):
+            if d not in tasks:
+                problems.append(f"{tid}: unknown dependency {d}")
+    # cycle check
+    seen, stackset = set(), set()
+
+    def visit(n):
+        if n in stackset:
+            problems.append(f"dependency cycle through {n}")
+            return
+        if n in seen:
+            return
+        stackset.add(n)
+        for d in tasks.get(n, {}).get("deps", []):
+            visit(d)
+        stackset.discard(n)
+        seen.add(n)
+    for n in tasks:
+        visit(n)
+    # parallel tasks in the same wave must own disjoint files
+    for m in ms:
+        for w in waves(m.get("tasks", []), set()):
+            for i, x in enumerate(w):
+                for y in w[i + 1:]:
+                    for gx in x.get("files", []):
+                        for gy in y.get("files", []):
+                            if gx == gy or fnmatch.fnmatch(gx, gy) or fnmatch.fnmatch(gy, gx):
+                                concerns.append(f"{x['id']} and {y['id']} run in parallel but both own '{gx}'"
+                                                " (add a dependency or split files)")
+    if len(ms) > prof["max_milestones"]:
+        problems.append(f"lane {lane} allows at most {prof['max_milestones']} milestone(s); plan has {len(ms)}")
+    planned = [t for t in tasks.values() if t.get("origin") != "fix"]
+    fixes = len(tasks) - len(planned)
+    if len(planned) > prof["max_tasks"]:
+        problems.append(f"lane {lane} allows at most {prof['max_tasks']} planned tasks; plan has {len(planned)} (merge small tasks)")
+    if fixes > max(3, prof["max_tasks"] // 2):
+        concerns.append(f"{fixes} fix tasks added by triage: quality is drifting; consider a conductor-level review")
+    known_areas = set(stack.get("areas", {})) | {"fullstack"}
+    for tid, t in tasks.items():
+        if stack.get("areas") and t.get("area") not in known_areas:
+            concerns.append(f"{tid}: set \"area\" to one of {sorted(known_areas)} so the right specialist builds it")
+        if t.get("allow_green") and not t.get("green_reason"):
+            problems.append(f"{tid}: allow_green needs a green_reason (why no new test can fail first)")
+    missing = sorted(reqs - covered, key=lambda r: int(r.split('-')[1]))
+    if missing:
+        problems.append(f"requirements not covered by any task: {', '.join(missing)}")
+    unknown = sorted(set(covered) - reqs)
+    if unknown and reqs:
+        concerns.append(f"tasks cite unknown requirements: {', '.join(unknown)}")
+    # plan width: parallel developers only help if several tasks are ready at once (the first real project averaged
+    # 1.1–1.8 tasks at once against a cap of 6, because plans were chains around one big task)
+    st_now = state(root)
+    done_ids = {i for i, v in st_now["tasks"].items() if v.get("status") in ("passed", "dropped")}
+    shape = {}
+    for m in ms:
+        mt = [tasks[t["id"]] for t in m.get("tasks", []) if t.get("id") in tasks and t["id"] not in done_ids]
+        if not mt:
+            continue
+        layers = waves(mt, done_ids)
+        widths = [len(x) for x in layers]
+        shape[m["id"]] = {"widths": widths, "critical_path": len(layers)}
+        if len(mt) >= 6 and max(widths[1:] or [widths[0]]) < 3:
+            concerns.append(f"{m['id']}: plan is narrow (wave widths {widths}); at most {max(widths)} tasks can run at once. "
+                            "Split foundation tasks or cut dependencies so ≥3 tasks are ready after the first wave")
+        for t in mt:
+            dependents = [x["id"] for x in mt if t["id"] in x.get("deps", [])]
+            if len(dependents) >= 4 and len(t.get("files", [])) >= 12:
+                concerns.append(f"{t['id']}: big foundation task ({len(t.get('files', []))} files) blocks {len(dependents)} tasks; "
+                                "split it so its dependents can start sooner")
+    protected_now = set(protected_tests(root))
+    for tid, t in tasks.items():
+        for f in t.get("amends_tests", []):
+            if f not in protected_now:
+                problems.append(f"{tid}: amends_tests lists {f}, which is not a protected test (list only existing protected tests)")
+        if t.get("amends_tests") and not t.get("amend_reason"):
+            problems.append(f"{tid}: amends_tests needs an amend_reason (what changed in the product that the tests must follow)")
+    verdict = "FAIL" if problems else ("CONCERNS" if concerns else "PASS")
+    res = {"verdict": verdict, "lane": lane, "problems": problems, "concerns": concerns,
+           "milestones": len(ms), "tasks": len(tasks), "requirements": len(reqs), "shape": shape}
+    if verdict != "FAIL":
+        root_state = state(root)
+        for tid in tasks:
+            root_state["tasks"].setdefault(tid, {"status": "todo", "rounds": 0, "history": []})
+        save_state(root, root_state)
+    out(res, a.json)
+    sys.exit(1 if verdict == "FAIL" else 0)
+
+
+def waves(tasks, done):
+    """Topological layers of tasks inside one milestone (deps outside it count as done)."""
+    ids = {t["id"] for t in tasks}
+    left = list(tasks)
+    finished = set(done)
+    layers = []
+    while left:
+        layer = [t for t in left if all(d in finished or d not in ids for d in t.get("deps", []))]
+        if not layer:
+            layers.append(left)  # cycle: validate-plan reports it
+            break
+        layers.append(layer)
+        finished |= {t["id"] for t in layer}
+        left = [t for t in left if t["id"] not in finished]
+    return layers
+
+
+# ---------- orchestration ----------
+def cmd_stage(a):
+    root = repo_root()
+    if a.name not in STAGES:
+        die(f"unknown stage; use one of {STAGES}")
+    with Locked(root):
+        st = state(root)
+        st["stage"] = a.name
+        save_state(root, st)
+    log(root, f"stage → {a.name}", "orchestrator")
+    print(json.dumps({"ok": True, "stage": a.name}))
+
+
+def cmd_next(a):
+    root = repo_root()
+    st = state(root)
+    cfg = run_cfg(root)
+    stage = st.get("stage", "intake")
+    b = budget_info(root)
+    if b["over"]:
+        return out({"action": "blocked", "why": f"budget reached ({b['units']:,} of {b['cap']:,} units)",
+                    "hint": "raise limits.budget_units in .pumori/run.json if you want to continue"}, a.json)
+    dirty = []
+    if stage in ("build", "release"):
+        with Locked(root):  # never commit while a gate is merging
+            dirty = autocommit_notes(root)
+    if dirty:
+        return out({"action": "blocked", "why": "main has uncommitted changes to tracked files; commit or discard them "
+                    "(gates refuse to merge onto a dirty main)", "files": dirty[:20]}, a.json)
+    if stage != "build":
+        return out({"action": stage}, a.json)
+    tasks = all_tasks(root)
+    done_ms = {mid for mid, v in st["milestones"].items() if v.get("status") == "done"}
+    stragglers = [t for tid, t in tasks.items() if t["milestone"] in done_ms
+                  and st["tasks"].get(tid, {}).get("status") not in ("passed", "dropped", "blocked")]
+    if stragglers:  # e.g. a later browser check reopened a task of an already-closed milestone
+        wave = []
+        for t in stragglers[:max_parallel(root)]:
+            ts = st["tasks"].get(t["id"], {})
+            t = dict(t)
+            if ts.get("instruction"):
+                t["conductor_instruction"] = ts["instruction"]
+            t["dev_agent"], t["area"] = dev_agent_for(root, t)
+            t["review_model"] = review_model(t, t["area"])
+            t["needs_tests"] = not ts.get("tests_committed")
+            t["tests_prewritten"] = False
+            wave.append(t)
+        return out({"action": "build", "milestone": stragglers[0]["milestone"], "wave": wave, "prewrite": [],
+                    "deferred": [], "round_cap": int(cfg["max_rounds"]), "base_branch": "main",
+                    "note": "reopened task(s) from a closed milestone"}, a.json)
+    # one QA and one build at a time, overlapping: while QA runs, later milestones build; while a build
+    # runs (`--building`), another milestone may be checked and QA'd (P3 v03: M3 waited ~70 min for M2's fixes)
+    qa_busy = next((m["id"] for m in tasks_doc(root).get("milestones", [])
+                    if st["milestones"].get(m["id"], {}).get("status") != "done"
+                    and qa_running(st["milestones"].get(m["id"], {}))), None)
+    build_busy = None
+    for m in tasks_doc(root).get("milestones", []):
+        mst = st["milestones"].setdefault(m["id"], {"status": "todo", "qa_cycles": 0})
+        if mst["status"] == "done" or qa_running(mst):
+            continue
+        mtasks = [tasks[t["id"]] for t in m["tasks"]]
+        blocked = [t["id"] for t in mtasks if st["tasks"].get(t["id"], {}).get("status") == "blocked"]
+        if blocked:
+            return out({"action": "blocked", "milestone": m["id"], "tasks": blocked,
+                        "why": "tasks escalated by the conductor; a human decision is needed"}, a.json)
+        passed_ids = {i for i, s2 in st["tasks"].items() if s2.get("status") in ("passed", "dropped")}
+        deps_done = lambda t: all(d in passed_ids for d in t.get("deps", []) if d in tasks)
+        # tests are written just before a task is built, once its dependencies are merged, so they can use
+        # contracts and stubs those dependencies created
+        untested = [t["id"] for t in mtasks if not st["tasks"].get(t["id"], {}).get("tests_committed")
+                    and st["tasks"].get(t["id"], {}).get("status") not in ("passed", "dropped") and deps_done(t)]
+        pipeline = load_json(root / ".pumori" / "run.json", {}).get("pipeline_tests", True)
+        if untested and not pipeline:
+            return out({"action": "tests", "milestone": m["id"], "tasks": [tasks[i] for i in untested]}, a.json)
+        open_ = [t for t in mtasks if st["tasks"].get(t["id"], {}).get("status") not in ("passed", "dropped")]
+        if open_ and getattr(a, "building", False):
+            build_busy = build_busy or m["id"]
+            continue  # its build is running; look for check/QA work in other milestones
+        if qa_busy and not open_:
+            continue  # its check/QA waits until the running QA reports; later milestones may still build
+        if open_:
+            passed = {i for i, s in st["tasks"].items() if s.get("status") == "passed"}
+            layers = waves(open_, passed)
+            first = [t for t in layers[0] if all(d in passed for d in t.get("deps", []) if d in tasks)
+                     and (pipeline or st["tasks"].get(t["id"], {}).get("tests_committed"))]
+            cap = max_parallel(root)
+            wave = []
+            for t in first[:cap]:
+                ts = st["tasks"].get(t["id"], {})
+                t = dict(t)
+                if ts.get("worktree") and pathlib.Path(ts["worktree"]).exists():
+                    t["resume_worktree"] = ts["worktree"]
+                if ts.get("instruction"):
+                    t["conductor_instruction"] = ts["instruction"]
+                t["dev_agent"], t["area"] = dev_agent_for(root, t)
+                t["review_model"] = review_model(t, t["area"])
+                t["needs_tests"] = not ts.get("tests_committed")
+                t["tests_prewritten"] = t["needs_tests"] and bool(t.get("test_files")) and all(
+                    (root / f).exists() or (prewrite_dir(root, t["id"]) / f).exists() for f in t["test_files"])
+                wave.append(t)
+            # tests for the next wave are written while this wave builds (e.g. while the contract builds)
+            building = {t["id"] for t in wave}
+            prewrite = []
+            # opt-in only: on P3 v01, 11 of 14 tests written ahead failed the red check (0 of 8 written in place)
+            prewrite_on = load_json(root / ".pumori" / "run.json", {}).get("prewrite_tests", False)
+            for t in (mtasks if prewrite_on else []):
+                ts = st["tasks"].get(t["id"], {})
+                undone = [d for d in t.get("deps", []) if d in tasks and d not in passed]
+                if (not ts.get("tests_committed") and ts.get("status") not in ("passed", "dropped") and undone
+                        and set(undone) <= building
+                        and not all((prewrite_dir(root, t["id"]) / f).exists() for f in t.get("test_files", []))):
+                    pt = dict(t)
+                    pt["prewrite_dir"] = str(prewrite_dir(root, t["id"]))
+                    pt["dev_agent"], pt["area"] = dev_agent_for(root, pt)
+                    prewrite.append(pt)
+                    continue
+            if not wave:
+                if qa_busy:
+                    continue
+                return out({"action": "blocked", "milestone": m["id"], "why": "open tasks but none is buildable "
+                            "(dependency cycle or a dependency outside the plan)", "tasks": [t["id"] for t in open_]}, a.json)
+            return out({"action": "build", "milestone": m["id"], "wave": wave, "prewrite": prewrite,
+                        "deferred": [t["id"] for t in first[cap:]],
+                        "round_cap": int(cfg["max_rounds"]), "base_branch": "main", "max_parallel": cap, "rolling": True,
+                        **({"note": f"overlaps QA of {qa_busy}: run it alongside, do not wait"} if qa_busy else {})}, a.json)
+        head = git(["rev-parse", "HEAD"], root).stdout.strip()
+        # once QA has checked a milestone, later merges (the next milestone overlapping) don't force a re-check
+        if mst.get("checked_sha") != head and mst.get("qa") not in ("passed", "checked"):
+            return out({"action": "check", "milestone": m["id"],
+                        "hint": f"run `pumori milestone-check {m['id']}` (browser suite of this milestone)"}, a.json)
+        if mst.get("qa") == "checked" and not blocking_journeys(root):
+            return out({"action": "close", "milestone": m["id"]}, a.json)
+        if mst.get("qa") != "passed":
+            if mst["qa_cycles"] >= int(cfg["max_qa_cycles"]) and mst.get("qa") == "failed":
+                return out({"action": "blocked", "milestone": m["id"],
+                            "why": f"QA failed {mst['qa_cycles']} cycles; human decision needed"}, a.json)
+            crit, deferred = qa_scope(root, m["id"])
+            return out({"action": "qa", "milestone": m["id"], "goal": m.get("goal"), "criteria": crit,
+                        "deferred": deferred, "journeys": ready_journeys(root),
+                        "qa_cycle": mst["qa_cycles"] + 1, "lane": lane_of(root)[0]}, a.json)
+        return out({"action": "close", "milestone": m["id"]}, a.json)
+    if qa_busy or build_busy:
+        running = " and ".join(x for x in (f"QA of {qa_busy}" if qa_busy else "", f"the build of {build_busy}" if build_busy else "") if x)
+        return out({"action": "wait", "milestone": qa_busy or build_busy,
+                    "why": f"{running} {'are' if qa_busy and build_busy else 'is'} running and nothing else can start yet; "
+                           "continue when it reports"}, a.json)
+    return out({"action": "release"}, a.json)
+
+
+QA_RUNNING_MAX_S = 90 * 60
+
+
+def qa_running(mst):
+    """QA started (pumori qa-start) and not yet finished (pumori qa-end); stale after 90 min."""
+    since = mst.get("qa_running_since")
+    if not since:
+        return False
+    try:
+        age = (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(since)).total_seconds()
+    except ValueError:
+        return False
+    return age < QA_RUNNING_MAX_S
+
+
+def wave_item(root, st, t):
+    """A task object ready to hand to the build-wave workflow."""
+    ts = st["tasks"].get(t["id"], {})
+    t = dict(t)
+    if ts.get("worktree") and pathlib.Path(ts["worktree"]).exists():
+        t["resume_worktree"] = ts["worktree"]
+    if ts.get("instruction"):
+        t["conductor_instruction"] = ts["instruction"]
+    t["dev_agent"], t["area"] = dev_agent_for(root, t)
+    t["review_model"] = review_model(t, t["area"])
+    t["needs_tests"] = not ts.get("tests_committed")
+    t["tests_prewritten"] = False
+    return t
+
+
+def cmd_ready(a):
+    """Rolling scheduling: tasks of a milestone whose dependencies have all merged, not yet passed, and not in
+    `--exclude` (the ones already running). build-wave calls this after every merge, so a newly unblocked task
+    starts at once instead of waiting for the whole wave (the first real project averaged 1.8 tasks at once of 6)."""
+    root = repo_root()
+    st = state(root)
+    tasks = all_tasks(root)
+    skip = set(filter(None, (a.exclude or "").split(",")))
+    passed = {i for i, s2 in st["tasks"].items() if s2.get("status") in ("passed", "dropped")}
+    ready = [wave_item(root, st, t) for tid, t in tasks.items()
+             if t["milestone"] == a.milestone and tid not in skip and tid not in passed
+             and st["tasks"].get(tid, {}).get("status") != "blocked"
+             and all(d in passed for d in t.get("deps", []) if d in tasks)]
+    print(json.dumps({"milestone": a.milestone, "ready": ready[:max(0, int(a.limit))]}))
+
+
+def cmd_flaky(a):
+    """Flaky tests quarantined by the gate: list them, or mark one fixed once its fix task has merged."""
+    root = repo_root()
+    with Locked(root):
+        st = state(root)
+        items = st.get("flaky", [])
+        if a.action == "fixed":
+            hit = [f for f in items if f["id"] == a.id]
+            if not hit:
+                die(f"unknown flaky id {a.id}")
+            hit[0].update({"fixed": True, "fixed_at": now(), "note": a.note})
+            save_state(root, st)
+            log(root, f"{a.id} fixed: {a.note}", "orchestrator")
+    print(json.dumps([{k: v for k, v in f.items() if k != "output"} | {"output_tail": f.get("output", "")[-600:]}
+                      for f in items], indent=2))
+
+
+def cmd_qa_mark(a):
+    root = repo_root()
+    with Locked(root):
+        st = state(root)
+        mst = st["milestones"].setdefault(a.milestone, {"status": "todo", "qa_cycles": 0})
+        if a.which == "start":
+            mst["qa_running_since"] = now()
+        else:
+            mst.pop("qa_running_since", None)
+        save_state(root, st)
+    log(root, f"QA {a.milestone} {'started (next milestone may build alongside)' if a.which == 'start' else 'finished'}", "orchestrator")
+    print(json.dumps({"ok": True}))
+
+
+def qa_scope(root, mid):
+    """REQs QA should check now (every task citing them is built) and REQs deferred to later tasks."""
+    st = state(root)
+    tasks = all_tasks(root)
+    done = lambda tid: st["tasks"].get(tid, {}).get("status") in ("passed", "dropped")
+    cited = {c for t in tasks.values() if t["milestone"] == mid for c in t.get("criteria", [])}
+    crit, deferred = [], {}
+    for r in sorted(cited, key=lambda x: int(x.split("-")[1]) if x.split("-")[-1].isdigit() else 0):
+        pending = [tid for tid, t in tasks.items() if r in t.get("criteria", []) and not done(tid)]
+        if pending:
+            deferred[r] = pending
+        else:
+            crit.append(r)
+    return crit, deferred
+
+
+def prewrite_dir(root, tid):
+    return rt(root) / "prewrite" / tid
+
+
+def e2e_files(root, files):
+    globs = stack_cfg(root).get("e2e_globs", ["e2e/**"])
+    return [f for f in files if globs_match(f, globs)]
+
+
+def cmd_milestone_check(a):
+    """Run each built task's browser tests on integrated main; reopen the tasks whose tests fail.
+    Holds the merge lock: with milestones overlapping, a merge must not change files mid-check."""
+    with Locked(repo_root()):
+        milestone_check(a)
+
+
+def milestone_check(a):
+    root = repo_root()
+    tasks = all_tasks(root)
+    st = state(root)
+    head = git(["rev-parse", "HEAD"], root).stdout.strip()
+    vwt = clean_checkout(root, head) or root
+    quick = run_stack(root, "verify_quick", vwt)
+    if not quick["ok"]:
+        print(json.dumps({"ok": False, "stage": "quick", "output": quick["output"][-2500:]}, indent=2))
+        sys.exit(1)
+    base_e2e = e2e_files(root, runnable(root, baseline_tests(root)))
+    results, reopened = [], []
+    # the gates run only affected tests, so the milestone check runs the whole unit/API suite once
+    order0 = [m["id"] for m in tasks_doc(root).get("milestones", [])]
+    upto0 = set(order0[:order0.index(a.milestone) + 1]) if a.milestone in order0 else set(order0)
+    unit_all = [f for f in runnable(root, baseline_tests(root) + [f for tid, t in tasks.items()
+                if st["tasks"].get(tid, {}).get("status") == "passed" and t["milestone"] in upto0
+                for f in t.get("test_files", [])]) if (root / f).exists() and f not in set(e2e_files(root, [f]))]
+    if unit_all:
+        full = run_stack(root, "verify_tests", vwt, sorted(set(unit_all)))
+        results.append({"task": "unit+api suite", "ok": full["ok"], "seconds": full["seconds"]})
+        if not full["ok"]:
+            results[-1]["output"] = full["output"][-2500:]
+            with Locked(root):
+                st2 = state(root)
+                st2["main_red"] = {"sha": head, "at": now(), "output": full["output"][-3000:], "files": sorted(set(unit_all))[:30]}
+                save_state(root, st2)
+            log(root, f"milestone {a.milestone}: full unit/API suite fails on main ({head[:8]}); merges pause until a fixes_main task lands", "gate")
+    # only this milestone and earlier ones: with milestones overlapping, later milestones' merged tasks
+    # can have browser tests that need their own still-unbuilt tasks (P3 v03 falsely reopened T14, T16)
+    order = [m["id"] for m in tasks_doc(root).get("milestones", [])]
+    upto = set(order[:order.index(a.milestone) + 1]) if a.milestone in order else set(order)
+    groups = [("baseline", base_e2e)] + [(tid, e2e_files(root, runnable(root, t.get("test_files", []))))
+                                         for tid, t in tasks.items()
+                                         if st["tasks"].get(tid, {}).get("status") == "passed"
+                                         and t["milestone"] in upto]
+    for tid, files in groups:
+        files = [f for f in files if (root / f).exists()]
+        if not files:
+            continue
+        r = run_stack(root, "verify_tests", vwt, files)
+        results.append({"task": tid, "ok": r["ok"], "seconds": r["seconds"]})
+        if not r["ok"] and tid != "baseline":
+            reopened.append(tid)
+            with Locked(root):
+                st2 = state(root)
+                ts = st2["tasks"][tid]
+                ts["status"] = "todo"
+                ts["rounds"] = 0
+                ts["instruction"] = ("Your merged task's browser tests fail on integrated main (another task's change "
+                                     "probably broke it, or it depended on something unmerged). Fix on a fresh branch "
+                                     "from main. Output:\n" + r["output"][-2000:])
+                ts.pop("worktree", None)
+                save_state(root, st2)
+        elif not r["ok"]:
+            results[-1]["output"] = r["output"][-2000:]
+    ok = all(x["ok"] for x in results)
+    with Locked(root):
+        st2 = state(root)
+        mst = st2["milestones"].setdefault(a.milestone, {"status": "todo", "qa_cycles": 0})
+        if ok:
+            mst["checked_sha"] = head
+        save_state(root, st2)
+    log(root, f"milestone {a.milestone} browser check {'PASS' if ok else 'FAIL: reopened ' + ','.join(reopened)}", "gate")
+    print(json.dumps({"ok": ok, "results": results, "reopened": reopened}, indent=2))
+    sys.exit(0 if ok else 1)
+
+
+NOTE_PATHS = (".pumori/", "docs/", "AGENTS.md", "CLAUDE.md")
+
+
+def dirty_tracked(root):
+    return [l[3:] for l in git(["status", "--porcelain", "--untracked-files=no"], root).stdout.splitlines() if l.strip()]
+
+
+def autocommit_notes(root):
+    """Commit roles' own notes on main (lessons, decisions, docs) so they never block a merge.
+    P3 v02: an uncommitted .pumori/lessons.md made every gate fail for ~20 min. Returns what is still dirty."""
+    dirty = dirty_tracked(root)
+    notes = [f for f in dirty if f.startswith(NOTE_PATHS)]
+    if notes:
+        git(["add", "--", *notes], root)
+        git(["-c", "user.name=Pumori", "-c", "user.email=pumori@localhost", "commit", "-qm",
+             "chore: notes from the team (auto-committed)", "--", *notes], root)
+        log(root, f"auto-committed team notes on main: {', '.join(notes[:5])}", "pumori")
+    return dirty_tracked(root)
+
+
+def cmd_commit_docs(a):
+    root = repo_root()
+    with Locked(root):
+        extra = [stack_cfg(root).get("mockups_dir")] if (root / ".pumori" / "stack.json").exists() else []
+        paths = [p for p in DOC_PATHS + [x for x in extra if x] if (root / p).exists()]
+        git(["add", "--", *paths], root, check=True)
+        if git(["diff", "--cached", "--quiet"], root).returncode == 0:
+            print(json.dumps({"ok": True, "committed": False}))
+            return
+        git(["-c", "user.name=Pumori", "-c", "user.email=pumori@localhost", "commit", "-qm", a.m], root, check=True)
+    log(root, f"docs committed: {a.m}", "orchestrator")
+    print(json.dumps({"ok": True, "committed": True}))
+
+
+def cmd_commit_tests(a):
+    """Red check: every task's new tests must typecheck and FAIL before any implementation."""
+    root = repo_root()
+    tasks = all_tasks(root)
+    mtasks = [t for t in tasks.values() if t["milestone"] == a.milestone]
+    if a.tasks:
+        mtasks = [t for t in mtasks if t["id"] in a.tasks.split(",")]
+    st = state(root)
+    results, to_commit = [], []
+    lock = Locked(root)
+    lock.__enter__()  # serialise with gates and other red checks: they all run checks in the main checkout
+    for t in mtasks:
+        if st["tasks"].get(t["id"], {}).get("tests_committed"):
+            continue
+        files = t.get("test_files", [])
+        for f in files:  # tests written ahead of time wait in a holding folder until their deps are merged
+            held = prewrite_dir(root, t["id"]) / f
+            if not (root / f).exists() and held.exists():
+                (root / f).parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(held), str(root / f))
+        missing = [f for f in files if not (root / f).exists()]
+        if missing:
+            results.append({"task": t["id"], "ok": False, "why": f"missing test files: {missing}"})
+            continue
+        # check only this task's tests on top of committed main, not other designers' unfinished drafts
+        vwt = clean_checkout(root, git(["rev-parse", "HEAD"], root).stdout.strip())
+        if vwt:
+            for f in files:
+                (vwt / f).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(root / f, vwt / f)
+        vwt = vwt or root
+        quick = run_stack(root, "verify_quick", vwt)
+        if not quick["ok"]:
+            results.append({"task": t["id"], "ok": False,
+                            "why": "tests must typecheck and lint against the CURRENT code (test via HTTP/UI)",
+                            "output": quick["output"][-3000:]})
+            continue
+        r = run_stack(root, "verify_tests", vwt, files)
+        if r["ok"] and not (t.get("allow_green") and t.get("green_reason")):
+            results.append({"task": t["id"], "ok": False,
+                            "why": "tests already pass before implementation: they do not test the new behaviour"})
+            continue
+        results.append({"task": t["id"], "ok": True, "red": True})
+        to_commit.append(t)
+    if to_commit:
+        if True:
+            files = [f for t in to_commit for f in t["test_files"]]
+            git(["add", "--", *files], root, check=True)
+            git(["-c", "user.name=Pumori", "-c", "user.email=pumori@localhost", "commit", "-qm",
+                 f"test({a.milestone}): failing tests for {', '.join(t['id'] for t in to_commit)}"], root, check=True)
+            st = state(root)
+            for t in to_commit:
+                ts = st["tasks"].setdefault(t["id"], {"status": "todo", "rounds": 0, "history": []})
+                ts["tests_committed"] = True
+                ts["tests_sha"] = git(["rev-parse", "HEAD"], root).stdout.strip()
+            save_state(root, st)
+        log(root, f"tests committed (red) for {', '.join(t['id'] for t in to_commit)}", "test-designer")
+    lock.__exit__(None, None, None)
+    for r in results:
+        if not r["ok"]:
+            log(root, f"red check rejected {r['task']}: {r.get('why', '')[:120]}", "test-designer")
+    ok = all(r["ok"] for r in results)
+    print(json.dumps({"ok": ok, "results": results}, indent=2))
+    sys.exit(0 if ok else 1)
+
+
+RUNNABLE_TEST_RE = r"\.(test|spec)\.[cm]?[jt]sx?$|(^|/)test_[^/]+\.py$|_test\.(py|go)$"
+
+
+def runnable(root, files):
+    rx = re.compile(stack_cfg(root).get("runnable_test_regex", RUNNABLE_TEST_RE))
+    return [f for f in files if rx.search(f)]
+
+
+def is_test_support(root, path):
+    return globs_match(path, stack_cfg(root).get("test_support_globs", []))
+
+
+def protected_tests(root):
+    st = state(root)
+    tasks = all_tasks(root)
+    files = [f for tid, t in tasks.items() if st["tasks"].get(tid, {}).get("tests_committed")
+             for f in t.get("test_files", [])]
+    return sorted(f for f in set(files) | set(baseline_tests(root)) if not is_test_support(root, f))
+
+
+def baseline_tests(root):
+    """Pre-existing tests that must always pass. Never includes a task's own test files:
+    those are red until their task is built (the snapshot may be taken after a red commit)."""
+    base = load_json(rt(root) / "baseline-tests.json")
+    if base is None:
+        globs = stack_cfg(root).get("test_globs", [])
+        tracked = git(["ls-files"], root).stdout.splitlines()
+        base = [f for f in tracked if globs_match(f, globs)]
+        save_json(rt(root) / "baseline-tests.json", base)
+    task_files = {f for t in all_tasks(root).values() for f in t.get("test_files", [])}
+    return [f for f in base if f not in task_files]
+
+
+def cmd_start_task(a):
+    root = repo_root()
+    here = checkout_root()
+    if here == root:
+        die("start-task must run inside the task's git worktree, not the main checkout")
+    tasks = all_tasks(root)
+    if a.task not in tasks:
+        die(f"unknown task {a.task}")
+    branch = git(["rev-parse", "--abbrev-ref", "HEAD"], here).stdout.strip()
+    with Locked(root):
+        st = state(root)
+        ts = st["tasks"].setdefault(a.task, {"status": "todo", "rounds": 0, "history": []})
+        if ts.get("status") == "passed":
+            die(f"{a.task} already passed")
+        cap = int(run_cfg(root)["max_rounds"])
+        if ts.get("rounds", 0) >= cap + 2:
+            die(f"{a.task} exceeded its round cap ({cap}); the conductor must decide before more rounds")
+        ts["rounds"] = ts.get("rounds", 0) + 1
+        ts.update({"status": "in_progress", "worktree": str(here), "branch": branch, "updated": now()})
+        save_state(root, st)
+    t = tasks[a.task]
+    log(root, f"{a.task} round {ts['rounds']} started on {branch}", "developer")
+    print(json.dumps({"ok": True, "task": a.task, "round": ts["rounds"], "round_cap": cap, "branch": branch,
+                      "worktree": str(here), "test_files": t["test_files"], "owned_files": t["files"],
+                      "verify": stack_cfg(root)["commands"]["verify_tests"].replace(
+                          "{files}", " ".join(t["test_files"]))}, indent=2))
+
+
+def cmd_handoff(a):
+    root = repo_root()
+    here = checkout_root()
+    data = read_stdin_json()
+    tasks = all_tasks(root)
+    t = tasks.get(a.task) or die(f"unknown task {a.task}")
+    dirty = git(["status", "--porcelain"], here).stdout.strip()
+    if dirty:
+        die("worktree has uncommitted changes; commit your work first (git add -A && git commit)")
+    head = git(["rev-parse", "HEAD"], here).stdout.strip()
+    files = runnable(root, t["test_files"])
+    if not lane_of(root)[1].get("e2e_at_gate"):
+        files = [f for f in files if f not in set(e2e_files(root, files))]
+    r = run_stack(root, "verify_tests", here, files) if files else run_stack(root, "verify_quick", here)
+    rec = {"task": a.task, "sha": head, "at": now(), "verify_ok": r["ok"], "verify_seconds": r["seconds"],
+           "handoff": data}
+    with Locked(root):
+        st = state(root)
+        ts = st["tasks"].setdefault(a.task, {"status": "todo", "rounds": 0, "history": []})
+        rnd = ts.get("rounds", 1)
+        save_json(rt(root) / "verdicts" / f"{a.task}-handoff-r{rnd}.json", rec)
+        ts["handoff_sha"] = head
+        ts["handoff_ok"] = r["ok"]
+        save_state(root, st)
+    log(root, f"{a.task} handoff r{rnd}: verify {'PASS' if r['ok'] else 'FAIL'}", "developer")
+    print(json.dumps({"ok": r["ok"], "sha": head, "verify": r["output"][-2500:]}, indent=2))
+    sys.exit(0 if r["ok"] else 1)
+
+
+def cmd_record(a):
+    root = repo_root()
+    data = read_stdin_json()
+    kind, ident = a.kind, a.ident
+    with Locked(root):
+        st = state(root)
+        if kind == "review":
+            ts = st["tasks"].get(ident) or die(f"unknown or unstarted task {ident}")
+            wt = ts.get("worktree")
+            if wt and not pathlib.Path(wt).exists():
+                wt = None
+            sha = git(["rev-parse", "--verify", "--quiet", ts.get("branch", "HEAD")], wt or root).stdout.strip()
+            if not sha:
+                die(f"branch {ts.get('branch')} of {ident} no longer exists. If its code is already on main, run "
+                    f"`pumori resolve {ident} merged` (checks its tests on main); otherwise `pumori resolve {ident} retry`.")
+            v = str(data.get("verdict", "")).upper()
+            if v not in ("APPROVE", "CHANGES", "NEEDS_HUMAN"):
+                die("review verdict must be APPROVE, CHANGES or NEEDS_HUMAN")
+            blocks = [f for f in data.get("findings", []) if str(f.get("severity", "")).upper() == "BLOCK"]
+            if v == "APPROVE" and blocks:
+                v = "CHANGES"
+            data.update({"verdict": v, "sha": sha, "at": now(), "round": ts.get("rounds", 1)})
+            save_json(rt(root) / "verdicts" / f"{ident}-review-r{ts.get('rounds', 1)}.json", data)
+            ts["review"] = {"verdict": v, "sha": sha, "blocks": len(blocks), "tests_ok": bool(data.get("tests_ok"))}
+            if v == "NEEDS_HUMAN":
+                ts["status"] = "blocked"
+        elif kind == "qa":
+            mst = st["milestones"].setdefault(ident, {"status": "todo", "qa_cycles": 0})
+            mst["qa_cycles"] = mst.get("qa_cycles", 0) + 1
+            bugs = data.get("bugs", [])
+            serious = [b for b in bugs if str(b.get("severity", "")).lower() in ("blocker", "major", "high", "critical")]
+            mst["qa"] = "failed" if serious or data.get("criteria_failed") else "checked"
+            mst["last_qa"] = {"bugs": len(bugs), "serious": len(serious), "at": now()}
+            data["verdict"] = f"{mst['qa']}: {len(bugs)} bugs ({len(serious)} serious), {len(data.get('criteria_failed') or [])} criteria failed"
+            save_json(rt(root) / "qa" / ident / f"cycle-{mst['qa_cycles']}.json", {**data, "at": now()})
+        elif kind == "judge":
+            j = st["journeys"].setdefault(ident, {"votes": []})
+            j["votes"].append({"satisfied": bool(data.get("satisfied")), "reason": data.get("reason", "")[:500],
+                               "run": data.get("run"), "at": now()})
+            recent = j["votes"][-int(run_cfg(root)["judge_votes"]):]
+            j["satisfied"] = sum(v["satisfied"] for v in recent) * 2 > len(recent)
+        elif kind == "conductor":
+            ts = st["tasks"].get(ident) or die(f"unknown task {ident}")
+            act = data.get("action")
+            if act not in ("continue", "simplify", "revert", "replan", "escalate"):
+                die("conductor action must be continue|simplify|revert|replan|escalate")
+            ts.setdefault("history", []).append({"conductor": data, "at": now()})
+            if act == "escalate":
+                ts["status"] = "blocked"
+            else:
+                ts["rounds"] = 0 if act in ("revert", "replan", "simplify") else max(0, int(run_cfg(root)["max_rounds"]) - 1)
+                ts["status"] = "todo"
+                ts["instruction"] = data.get("instruction") or data.get("why", "")
+                if act == "revert":
+                    ts.pop("worktree", None)  # replan/simplify keep the branch so finished work can be reused
+        elif kind == "test-review":
+            files = amend_files(root, ident)
+            diff = git(["diff", "HEAD", "--", *files], root).stdout
+            if not diff.strip():
+                die("no uncommitted change to protected tests to review")
+            v = str(data.get("verdict", "")).upper()
+            if v not in ("APPROVE", "REJECT"):
+                die("test-review verdict must be APPROVE or REJECT")
+            st.setdefault("test_reviews", {})[ident] = {"verdict": v, "diff_sha": hashlib.sha1(diff.encode()).hexdigest(),
+                                                       "reason": data.get("reason", "")[:500], "at": now()}
+        else:
+            die("kind must be review|qa|judge|conductor|test-review")
+        save_state(root, st)
+    log(root, f"{kind} recorded for {ident}" + (f": {data.get('verdict') or data.get('action') or ('satisfied' if data.get('satisfied') else 'not satisfied' if kind == 'judge' else '')}"), {"review": "reviewer", "qa": "qa", "judge": "judge", "conductor": "architect", "test-review": "reviewer"}.get(kind, kind))
+    print(json.dumps({"ok": True}))
+
+
+RUNNER_CONFIGS = ("vitest.config", "playwright.config", "jest.config", "pytest.ini", "conftest.py")
+
+
+def is_runner_config(path):
+    return any(c in pathlib.Path(path).name for c in RUNNER_CONFIGS)
+
+
+def runner_configs(root):
+    return [f for f in git(["ls-files"], root).stdout.splitlines() if is_runner_config(f)]
+
+
+def changed_files(root, base, head):
+    out = git(["diff", "--name-status", "-M", f"{base}...{head}"], root).stdout
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2:
+            rows.append((parts[0][0], parts[1], parts[-1]))
+    return rows
+
+
+def test_guard(root, base, head, task):
+    stack = stack_cfg(root)
+    protected = set(protected_tests(root))
+    skip_re = re.compile(stack.get("skip_marker_regex", r"\.(skip|only)\("))
+    problems = []
+    amends = set(task.get("amends_tests", []))
+    amended = []
+    for status, old, new in changed_files(root, base, head):
+        if (old in protected or new in protected) and (old in amends or new in amends) and status != "D":
+            amended.append(new)  # planned test update for this change; the reviewer must confirm it (tests_ok)
+            continue
+        if old in protected or new in protected:
+            problems.append(f"protected test file changed ({status}): {old}")
+            continue
+        if globs_match(new, stack.get("test_globs", [])) and status != "D":
+            diff = git(["diff", "-U0", f"{base}...{head}", "--", new], root).stdout
+            added = [l for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++")]
+            if any(skip_re.search(l) for l in added):
+                problems.append(f"skip/only marker added in {new}")
+        if is_runner_config(new) and status != "A":
+            # a change already landed on main (through amend-test) is not this branch's change
+            if git(["show", f"{base}:{new}"], root).stdout != git(["show", f"{head}:{new}"], root).stdout:
+                problems.append(f"test runner config changed: {new}. Runner configs change only through "
+                                "`pumori amend-test config` (Test Designer edits on main, Reviewer approves); "
+                                "revert it in the branch and put the needed change in not_done")
+    owned = task.get("files", []) + task.get("test_files", [])
+    scope = [new for _, _, new in changed_files(root, base, head)
+             if not globs_match(new, owned) and not new.startswith((".pumori/", "pnpm-lock", "package-lock"))]
+    task["_amended"] = amended
+    return problems, scope
+
+
+VERIFY_WT = ".claude/worktrees/pumori-verify"
+# only dependency/tooling changes need the whole suite; code changes run the tests that import them (vitest related)
+BROAD_CHANGE_RE = r"package\.json$|pnpm-lock|tsconfig|\.config\.(ts|js|mjs|cjs)$|(^|/)env\.ts$|(^|/)test/setup\.tsx?$"
+
+
+def clean_checkout(root, sha):
+    """A clean worktree at `sha` that no agent writes to. Gates, red checks and milestone checks run their checks
+    here, so unfinished files other agents leave in the shared main checkout can't fail them (first real project:
+    one test designer's draft failed every gate and red check). Callers hold the merge lock, so one copy is enough.
+    Ignored files (node_modules, build caches, .verify) survive between uses. Returns None if it can't be made."""
+    wt = root / VERIFY_WT
+    if not (wt / ".git").exists():
+        if wt.exists():
+            shutil.rmtree(wt, ignore_errors=True)
+        git(["worktree", "prune"], root)
+        wt.parent.mkdir(parents=True, exist_ok=True)
+        if git(["worktree", "add", "--detach", str(wt), sha], root).returncode != 0:
+            return None
+    if git(["checkout", "-q", "--force", "--detach", sha], wt).returncode != 0:
+        return None
+    git(["reset", "-q", "--hard", sha], wt)
+    git(["clean", "-fdq"], wt)  # untracked files go; ignored ones (node_modules, caches) stay
+    return wt
+
+
+CIRCUIT_WINDOW_S = 15 * 60
+CIRCUIT_TASKS = 3
+
+
+def cmd_gate(a):
+    root = repo_root()
+    tasks = all_tasks(root)
+    t = tasks.get(a.task) or die(f"unknown task {a.task}", as_json=True)
+    with Locked(root):
+        st = state(root)
+        ts = st["tasks"].get(a.task) or die("task never started", as_json=True)
+        branch = ts.get("branch")
+        res = {"task": a.task, "branch": branch, "ok": False}
+
+        def fail(stage, why, extra=None):
+            ts.setdefault("history", []).append({"gate": stage, "why": why[:400], "at": now()})
+            ts["status"] = "in_progress"
+            save_state(root, st)
+            log(root, f"{a.task} gate FAIL at {stage}: {why[:120]}", "gate")
+            print(json.dumps({**res, "stage": stage, "why": why, **(extra or {})}, indent=2))
+            sys.exit(1)
+
+        if ts.get("status") == "passed":
+            print(json.dumps({**res, "ok": True, "already": True}))
+            return
+        dirty = autocommit_notes(root)
+        if dirty:
+            # an environment problem, not the developer's: build-wave stops instead of burning fix rounds
+            fail("main-clean", "main checkout has uncommitted changes to product files (not this task's fault): "
+                 + ", ".join(dirty[:10]), {"environment": True, "files": dirty[:20]})
+        if git(["rev-parse", "--abbrev-ref", "HEAD"], root).stdout.strip() != "main":
+            fail("main-branch", "main checkout is not on branch main")
+        head = git(["rev-parse", branch], root).stdout.strip()
+        if not head:
+            fail("branch", f"branch {branch} not found")
+        rv = ts.get("review") or {}
+        if rv.get("verdict") != "APPROVE" or rv.get("sha") != head:
+            fail("review", "no APPROVE verdict for the current branch head (re-review after every change)")
+        problems, scope = test_guard(root, "main", head, t)
+        if problems:
+            fail("test-guard", "; ".join(problems))
+        if t.get("_amended") and not rv.get("tests_ok"):
+            fail("test-guard", "this task changes protected tests " + ", ".join(t["_amended"][:8]) + " (planned in amends_tests); "
+                 "the reviewer must check those diffs (no weakened or deleted assertions without a reason) and record tests_ok: true")
+        before = git(["rev-parse", "HEAD"], root).stdout.strip()
+        # main is known red (or many tasks just failed the same way): don't blame this task, don't loop.
+        # A task marked "fixes_main" (the fix the Architect adds) is always let through.
+        if not t.get("fixes_main"):
+            red = st.get("main_red")
+            if red and red.get("sha") == before:
+                fail("main-red", "main itself fails tests that were green before (not this task's fault); merges pause "
+                     "until a fixes_main task repairs it", {"environment": True, "output": red.get("output", "")[-2000:]})
+            if red and red.get("sha") != before:
+                st.pop("main_red", None)  # main moved on (e.g. a fix merged); check afresh
+            brk = st.get("circuit_open")
+            if brk and time.time() - brk.get("t", 0) < CIRCUIT_WINDOW_S:
+                fail("circuit-open", f"{len(brk.get('tasks', []))} different tasks failed after merging within "
+                     f"{CIRCUIT_WINDOW_S // 60} min ({', '.join(brk.get('tasks', []))}); merges pause for diagnosis",
+                     {"environment": True, "output": brk.get("output", "")[-2000:]})
+        m = git(["-c", "user.name=Pumori", "-c", "user.email=pumori@localhost", "merge", "--no-ff",
+                 "-m", f"merge {a.task}: {t['title']}", branch], root)
+        if m.returncode != 0:
+            git(["merge", "--abort"], root)
+            fail("merge", "merge conflict with main; rebase the task branch on main and resolve",
+                 {"output": (m.stdout + m.stderr)[-1500:]})
+        passed = [tid for tid, s in st["tasks"].items() if s.get("status") == "passed"]
+        files = sorted(set(protected_tests(root)) | set(t["test_files"]))
+        files = [f for f in files if (root / f).exists() and
+                 (f in t["test_files"] or any(f in tasks.get(p, {}).get("test_files", []) for p in passed)
+                  or f in baseline_tests(root))]
+        run_files = runnable(root, files)
+        # Affected tests only (the full suite runs at the milestone check). the first real project: re-running every
+        # task's tests at each merge grew the gate from 38 s to ~3 min. A broad change (shared package, schema,
+        # lib, env, dependencies) still runs everything.
+        changed = [n for st_, _, n in changed_files(root, before, head) if st_ != "D"]
+        sources = []
+        if not any(re.search(BROAD_CHANGE_RE, f) for f in changed):
+            touched = set(changed)
+            base_unit = [f for f in baseline_tests(root) if f not in set(e2e_files(root, baseline_tests(root)))]
+            run_files = [f for f in run_files if f in t["test_files"] or f in base_unit or f in touched]
+            # changed source files: the stack runs the tests that import them (next-fastify-postgres: vitest related)
+            if stack_cfg(root).get("verify_accepts_sources"):
+                sources = [f for f in changed if not globs_match(f, stack_cfg(root).get("test_globs", []))
+                           and re.search(r"\.(ts|tsx|js|jsx|py|go)$", f)]
+        if not lane_of(root)[1].get("e2e_at_gate"):
+            e2e = set(e2e_files(root, run_files))
+            # this task's own browser tests run now if every task sharing its requirements is merged
+            # (e.g. the frontend task merges after its backend twin): integration bugs go straight back
+            # to this developer instead of reopening the task at the milestone check
+            mine = set(e2e_files(root, runnable(root, t["test_files"])))
+            peers = [pid for pid, pt in tasks.items() if pid != a.task
+                     and set(pt.get("criteria", [])) & set(t.get("criteria", []))]
+            peers_done = all(st["tasks"].get(pid, {}).get("status") in ("passed", "dropped") for pid in peers)
+            # own browser test at the gate only when other tasks build on this one (a leaf screen's e2e runs at the
+            # milestone check; skipping it saves ~60-90 s of server start per merge)
+            has_dependents = any(a.task in pt.get("deps", []) for pt in tasks.values())
+            run_files = [f for f in run_files if f not in e2e or (peers_done and has_dependents and f in mine)]
+        merged = git(["rev-parse", "HEAD"], root).stdout.strip()
+        vwt = clean_checkout(root, merged) or root
+        run_args = run_files + [f for f in sources if f not in run_files]
+        r = run_stack(root, "verify_tests", vwt, run_args) if run_args else run_stack(root, "verify_quick", vwt)
+        if not r["ok"]:
+            # retry once: a pass on retry means a flaky test, not this task's fault. Merge, but quarantine it as a
+            # must-fix record that blocks closing the milestone (intermittent failures are sometimes real races).
+            again_r = run_stack(root, "verify_tests", vwt, run_args) if run_args else run_stack(root, "verify_quick", vwt)
+            if again_r["ok"]:
+                fid = f"FLAKY-{len(st.get('flaky', [])) + 1}"
+                st.setdefault("flaky", []).append({"id": fid, "task": a.task, "at": now(), "fixed": False,
+                                                   "output": r["output"][-2500:]})
+                log(root, f"{fid}: a test failed then passed while gating {a.task}; merged, quarantined until a fix task lands", "gate")
+                r = again_r
+        if not r["ok"]:
+            git(["reset", "--hard", before], root)
+            # Is main itself red? Re-run the tests that should already pass on main (earlier tasks' and the
+            # baseline's; this task's own tests are red on main by design). P3-style loops: T7/T8 failed 10 merges
+            # because main's login test had become flaky.
+            should_pass = [f for f in run_files if f not in set(t["test_files"])]
+            if should_pass:
+                again = run_stack(root, "verify_tests", clean_checkout(root, before) or root, should_pass)
+                if not again["ok"]:
+                    st["main_red"] = {"sha": before, "at": now(), "output": again["output"][-3000:], "files": should_pass[:30]}
+                    log(root, f"main is red at {before[:8]} (found while gating {a.task}); merges pause until a fixes_main task lands", "gate")
+                    fail("main-red", "main itself fails tests that should pass (not this task's fault); merges pause "
+                         "until a fixes_main task repairs it", {"environment": True, "output": again["output"][-3000:]})
+            recent = [x for x in st.get("gate_fails", []) if time.time() - x.get("t", 0) < CIRCUIT_WINDOW_S]
+            recent.append({"t": time.time(), "task": a.task})
+            st["gate_fails"] = recent
+            failing = sorted({x["task"] for x in recent})
+            if len(failing) >= CIRCUIT_TASKS:
+                st["circuit_open"] = {"t": time.time(), "at": now(), "tasks": failing, "output": r["output"][-3000:]}
+                log(root, f"circuit open: {len(failing)} tasks failed after merging within {CIRCUIT_WINDOW_S // 60} min "
+                    f"({', '.join(failing)}); merges pause for diagnosis", "gate")
+            fail("verify-after-merge", "checks failed after merging into main (regression or integration bug)",
+                 {"output": r["output"][-3000:]})
+        st.pop("circuit_open", None)  # a clean merge closes the breaker
+        st["gate_fails"] = []
+        ts.update({"status": "passed", "passed_at": now(), "merged_sha": git(["rev-parse", "HEAD"], root).stdout.strip(),
+                   "scope_warnings": scope[:20]})
+        save_state(root, st)
+    wt = ts.get("worktree") or ""
+    if "/.claude/worktrees/" in wt and pathlib.Path(wt).exists():  # workflow-made worktree: ours to clean
+        git(["worktree", "remove", "--force", wt], root)
+        git(["branch", "-D", branch], root)
+        sweep_dbs(root)  # the removed checkout's test DBs
+    # worktrees made by the desktop app for developer sessions are left for the app/human to clean
+    log(root, f"{a.task} PASSED and merged ({r['seconds']}s verify)", "gate")
+    print(json.dumps({**res, "ok": True, "verify_seconds": r["seconds"], "scope_warnings": scope[:20]}, indent=2))
+
+
+def cmd_add_tasks(a):
+    root = repo_root()
+    data = read_stdin_json()
+    new = data.get("tasks", data if isinstance(data, list) else [])
+    mid = data.get("milestone") if isinstance(data, dict) else None
+    doc = tasks_doc(root)
+    existing = all_tasks(root)
+    target = next((m for m in doc["milestones"] if m["id"] == mid), None) if mid else None
+    if not target:
+        target = next((m for m in doc["milestones"] if state(root)["milestones"].get(m["id"], {}).get("status") != "done"), None)
+    if not target:
+        target = {"id": f"M{len(doc['milestones']) + 1}", "name": "Follow-ups", "goal": "Fix and change requests", "tasks": []}
+        doc["milestones"].append(target)
+    for t in new:
+        if t.get("id") in existing:
+            die(f"task id {t['id']} already exists")
+        for k in ("id", "title", "description", "criteria", "files", "test_files", "deps"):
+            if k not in t:
+                die(f"new task missing '{k}'")
+        t.setdefault("origin", "fix")  # triage tasks don't count against the lane's planned-task cap
+        target["tasks"].append(t)
+    save_json(root / ".pumori" / "tasks.json", doc)
+    with Locked(root):
+        st = state(root)
+        for t in new:
+            st["tasks"].setdefault(t["id"], {"status": "todo", "rounds": 0, "history": []})
+        st["milestones"].setdefault(target["id"], {"status": "todo", "qa_cycles": 0})["qa"] = None
+        save_state(root, st)
+    log(root, f"added tasks {[t['id'] for t in new]} to {target['id']}", "architect")
+    print(json.dumps({"ok": True, "milestone": target["id"], "added": [t["id"] for t in new]}))
+
+
+def journeys(root):
+    out = []
+    for p in sorted(scenarios_dir(root).glob("SC-*.md")):
+        meta = frontmatter(p.read_text())
+        req = meta.get("requires", [])
+        out.append({"id": meta.get("id", p.stem), "requires": req if isinstance(req, list) else [req],
+                    "path": str(p)})
+    return out
+
+
+def ready_journeys(root):
+    st = state(root)
+    tasks = all_tasks(root)
+    # a REQ counts as built only when every task citing it has passed (the first real project judged journeys while
+    # their UI tasks were still open, because one backend task citing the REQ had merged)
+    done = lambda tid: st["tasks"].get(tid, {}).get("status") in ("passed", "dropped")
+    cited = collections.defaultdict(list)
+    for tid, t in tasks.items():
+        for c in t.get("criteria", []):
+            cited[c].append(tid)
+    covered = {c for c, tids in cited.items() if all(done(x) for x in tids)}
+    all_done = bool(tasks) and all(st["tasks"].get(t, {}).get("status") in ("passed", "dropped") for t in tasks)
+
+    def ready(j):
+        req = set(j["requires"])
+        if "ALL" in req:
+            return all_done
+        return bool(req) and req <= covered
+    return [j["id"] for j in journeys(root) if ready(j) and not st["journeys"].get(j["id"], {}).get("satisfied")]
+
+
+def blocking_journeys(root):
+    """Ready, unsatisfied journeys that block closing a milestone. A journey the human accepted as a known gap
+    (pumori milestone-accept) still gets re-run at later QA, but no longer blocks."""
+    st = state(root)
+    return [j for j in ready_journeys(root) if not st["journeys"].get(j, {}).get("accepted_gap")]
+
+
+def cmd_milestone_accept(a):
+    """Human decision: close a milestone whose tasks are all built but whose QA or journeys still fail,
+    recording what remains as known gaps. Only for a decision the human made explicitly."""
+    root = repo_root()
+    tasks = all_tasks(root)
+    with Locked(root):
+        st = state(root)
+        mst = st["milestones"].setdefault(a.milestone, {"status": "todo", "qa_cycles": 0})
+        open_ = [tid for tid, t in tasks.items() if t["milestone"] == a.milestone
+                 and st["tasks"].get(tid, {}).get("status") not in ("passed", "dropped")]
+        if open_:
+            print(json.dumps({"ok": False, "why": "tasks not built yet; accept is only for QA/journey gaps", "open_tasks": open_}))
+            sys.exit(1)
+        gaps = ready_journeys(root)
+        for j in gaps:
+            st["journeys"].setdefault(j, {"votes": []})["accepted_gap"] = {"milestone": a.milestone, "reason": a.reason, "at": now()}
+        mst.update({"status": "done", "qa": "accepted", "closed_at": now(),
+                    "accepted": {"reason": a.reason, "qa_was": mst.get("qa"), "journeys": gaps, "at": now()}})
+        mst.pop("qa_running_since", None)
+        save_state(root, st)
+    log(root, f"milestone {a.milestone} accepted by the human with known gaps ({', '.join(gaps) or 'QA findings'}): {a.reason}", "orchestrator")
+    print(json.dumps({"ok": True, "milestone": a.milestone, "accepted_journeys": gaps}))
+
+
+def cmd_journeys(a):
+    root = repo_root()
+    st = state(root)
+    js = journeys(root)
+    ready = set(ready_journeys(root))
+    rows = [{"id": j["id"], "requires": j["requires"], "ready": j["id"] in ready,
+             "satisfied": st["journeys"].get(j["id"], {}).get("satisfied", False)} for j in js]
+    if a.ready:
+        rows = [r for r in rows if r["ready"]]
+    print(json.dumps(rows, indent=2) if a.json else "\n".join(
+        f"{r['id']}: ready={r['ready']} satisfied={r['satisfied']}" for r in rows) or "no journeys")
+
+
+def cmd_milestone_close(a):
+    root = repo_root()
+    tasks = all_tasks(root)
+    with Locked(root):
+        st = state(root)
+        mst = st["milestones"].setdefault(a.milestone, {"status": "todo", "qa_cycles": 0})
+        open_ = [tid for tid, t in tasks.items() if t["milestone"] == a.milestone
+                 and st["tasks"].get(tid, {}).get("status") not in ("passed", "dropped")]
+        pending = blocking_journeys(root)
+        flaky_open = [f["id"] for f in st.get("flaky", []) if not f.get("fixed")]
+        if open_ or mst.get("qa") != "checked" or pending or flaky_open:
+            print(json.dumps({"ok": False, "open_tasks": open_, "qa": mst.get("qa"), "unsatisfied_journeys": pending,
+                              "flaky_open": flaky_open}))
+            sys.exit(1)
+        mst["status"] = "done"
+        mst["qa"] = "passed"
+        mst["closed_at"] = now()
+        save_state(root, st)
+    log(root, f"milestone {a.milestone} closed", "orchestrator")
+    sweep_dbs(root)
+    print(json.dumps({"ok": True}))
+
+
+# ---------- budget (tokens from Claude Code session transcripts) ----------
+WEIGHTS = {"input_tokens": 1.0, "cache_creation_input_tokens": 1.25, "cache_read_input_tokens": 0.1,
+           "output_tokens": 5.0}
+
+
+def session_dir_from_transcript(tp):
+    p = pathlib.Path(tp)
+    if "subagents" in p.parts:
+        return p.parents[len(p.parts) - 1 - p.parts.index("subagents")]
+    return p.parent / p.stem
+
+
+def budget_info(root, transcript=None):
+    st = state(root)
+    cfg = run_cfg(root)
+    cache = load_json(rt(root) / "budget-cache.json", {})
+    if transcript:
+        sd = str(session_dir_from_transcript(transcript))
+        if sd not in st.get("sessions", []):
+            with Locked(root):
+                st = state(root)
+                st.setdefault("sessions", []).append(sd)
+                save_state(root, st)
+    if cache.get("t", 0) > time.time() - 45 and cache.get("sessions") == st.get("sessions"):
+        units = cache["units"]
+    else:
+        since = st.get("started_at", "")
+        units, raw = 0.0, {k: 0 for k in WEIGHTS}
+        for sd in st.get("sessions", []):
+            files = [pathlib.Path(sd + ".jsonl")] + list(pathlib.Path(sd).glob("**/*.jsonl"))
+            for f in files:
+                seen = set()  # one reply is logged as several lines with the same message id and usage
+                try:
+                    with open(f) as fh:
+                        for line in fh:
+                            if '"usage"' not in line:
+                                continue
+                            try:
+                                d = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if d.get("timestamp", "") < since:
+                                continue
+                            mid = (d.get("message") or {}).get("id")
+                            if mid:
+                                if mid in seen:
+                                    continue
+                                seen.add(mid)
+                            u = (d.get("message") or {}).get("usage") or {}
+                            for k, w in WEIGHTS.items():
+                                raw[k] += u.get(k, 0) or 0
+                                units += (u.get(k, 0) or 0) * w
+                except OSError:
+                    continue
+        units = int(units)
+        save_json(rt(root) / "budget-cache.json", {"t": time.time(), "units": units, "raw": raw,
+                                                    "sessions": st.get("sessions", [])})
+    cap = int(cfg["budget_units"])
+    return {"units": units, "cap": cap, "pct": round(100 * units / cap, 1) if cap else 0, "over": units >= cap,
+            "raw": load_json(rt(root) / "budget-cache.json", {}).get("raw", {})}
+
+
+def cost_by_role(root):
+    """Budget units per role, from this run's session transcripts (each reply counted once)."""
+    st = state(root)
+    since = st.get("started_at", "")
+    roles = collections.defaultdict(lambda: {"units": 0.0, "runs": 0})
+    for sd in st.get("sessions", []):
+        sdp = pathlib.Path(sd)
+        title = load_json(sdp / "custom-title.json", {}).get("customTitle", "orchestrator / desk")
+        files = [(pathlib.Path(sd + ".jsonl"), f"session: {title}")]
+        for f in sdp.glob("**/*.jsonl"):
+            meta = load_json(pathlib.Path(str(f)[:-6] + ".meta.json"), {})
+            files.append((f, meta.get("agentType") or "other"))
+        for f, role in files:
+            seen, units = set(), 0.0
+            try:
+                for line in open(f):
+                    if '"usage"' not in line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if d.get("timestamp", "") < since:
+                        continue
+                    m = d.get("message") or {}
+                    if m.get("id") in seen:
+                        continue
+                    seen.add(m.get("id"))
+                    units += sum((m.get("usage") or {}).get(k, 0) * w for k, w in WEIGHTS.items())
+            except OSError:
+                continue
+            if units:
+                roles[role]["units"] += units
+                roles[role]["runs"] += 1
+    total = sum(v["units"] for v in roles.values()) or 1
+    return [{"role": r, "units": int(v["units"]), "share": round(100 * v["units"] / total, 1), "runs": v["runs"]}
+            for r, v in sorted(roles.items(), key=lambda x: -x[1]["units"])]
+
+
+def cmd_cost(a):
+    rows = cost_by_role(repo_root())
+    if a.json:
+        print(json.dumps(rows, indent=2))
+    else:
+        for r in rows:
+            print(f"{r['units'] / 1e6:8.1f}M  {r['share']:5.1f}%  x{r['runs']:<4} {r['role']}")
+
+
+def cmd_budget(a):
+    root = repo_root()
+    b = budget_info(root)
+    if a.json:
+        print(json.dumps(b, indent=2))
+    else:
+        print(f"{b['units']:,} / {b['cap']:,} units ({b['pct']}%)  units ≈ input-token-equivalents "
+              f"(output×5, cache-write×1.25, cache-read×0.1)")
+
+
+# ---------- status ----------
+def status_data(root):
+    st = state(root)
+    tasks = all_tasks(root)
+    cfg = run_cfg(root)
+    counts = {}
+    for tid in tasks:
+        s = st["tasks"].get(tid, {}).get("status", "todo")
+        counts[s] = counts.get(s, 0) + 1
+    js = journeys(root)
+    sat = sum(1 for j in js if st["journeys"].get(j["id"], {}).get("satisfied"))
+    return {"project": cfg.get("project"), "stage": st.get("stage"), "tasks": counts, "total_tasks": len(tasks),
+            "milestones": {m: v.get("status") for m, v in st["milestones"].items()},
+            "journeys": f"{sat}/{len(js)} satisfied", "budget": budget_info(root),
+            "rounds": sum(st["tasks"].get(t, {}).get("rounds", 0) for t in tasks),
+            "urls": {k: v.format(**{**cfg.get("ports", {}),
+                                    "STAGING_WEB_PORT": int(cfg.get("ports", {}).get("WEB_PORT", 0) or 0) + 1000})
+                     for k, v in stack_cfg(root).get("urls", {}).items()} if cfg.get("ports") else {},
+            "recent": (rt(root) / "progress.log").read_text().splitlines()[-15:]
+            if (rt(root) / "progress.log").exists() else []}
+
+
+def cmd_status(a):
+    root = repo_root()
+    d = status_data(root)
+    if a.html:
+        st = state(root)
+        tasks = all_tasks(root)
+        rows = "".join(f"<tr><td>{html.escape(tid)}</td><td>{html.escape(t['milestone'])}</td>"
+                       f"<td>{html.escape(t['title'])}</td><td class='s-{st['tasks'].get(tid, {}).get('status', 'todo')}'>"
+                       f"{st['tasks'].get(tid, {}).get('status', 'todo')}</td>"
+                       f"<td>{st['tasks'].get(tid, {}).get('rounds', 0)}</td></tr>" for tid, t in tasks.items())
+        roster = load_json(rt(root) / "roster.json", {})
+        roster_html = ""
+        if roster:
+            roster_html = "<h3>Team</h3><ul>" + "".join(
+                f"<li><b>{html.escape(role)}</b>: <a href='claude://claude.ai/epitaxy/{html.escape(v['session'])}'>"
+                f"{html.escape(v.get('title', role))}</a></li>" for role, v in roster.items()) + "</ul>"
+        evs = []
+        ep = rt(root) / "events.jsonl"
+        if ep.exists():
+            for line in ep.read_text().splitlines()[-200:]:
+                try:
+                    evs.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+        counts = {}
+        for e in evs:
+            counts[e["role"]] = counts.get(e["role"], 0) + 1
+        timeline_html = ("<h3>Who did what</h3><p>" + " · ".join(f"{html.escape(k)} {v}" for k, v in sorted(counts.items()))
+                         + "</p><table><tr><th>Time (UTC)</th><th>Role</th><th>Event</th></tr>"
+                         + "".join(f"<tr><td>{html.escape(e['at'][11:19])}</td><td class='r'>{html.escape(e['role'])}</td>"
+                                   f"<td>{html.escape(e['msg'])}</td></tr>" for e in reversed(evs[-80:])) + "</table>")
+        page = f"""<!doctype html><meta charset=utf-8><meta http-equiv=refresh content=20>
+<title>Pumori · {html.escape(str(d['project']))}</title><style>
+body{{font:14px system-ui;margin:24px;max-width:1000px;color:#1b1f24;background:#fff}}
+td,th{{padding:4px 10px;border-bottom:1px solid #e5e7eb;text-align:left}}.s-passed{{color:#15803d}}
+.s-blocked{{color:#b91c1c;font-weight:600}}.r{{font-weight:600;white-space:nowrap}}.s-in_progress{{color:#a16207}}pre{{background:#f6f8fa;padding:10px}}
+@media (prefers-color-scheme:dark){{body{{background:#0d1117;color:#e6edf3}}pre{{background:#161b22}}td,th{{border-color:#30363d}}}}
+</style><h1>Pumori · {html.escape(str(d['project']))}</h1>
+<p>Stage <b>{d['stage']}</b> · journeys {d['journeys']} · budget {d['budget']['pct']}% ·
+rounds {d['rounds']} · {' · '.join(f'<a href="{u}">{k}</a>' for k, u in d['urls'].items())}</p>
+<table><tr><th>Task</th><th>M</th><th>Title</th><th>Status</th><th>Rounds</th></tr>{rows}</table>
+{roster_html}{timeline_html}"""
+        path = rt(root) / "status.html"
+        path.write_text(page)
+        d["status_page"] = str(path)
+    out(d, a.json)
+
+
+def cmd_log(a):
+    root = repo_root()
+    log(root, " ".join(a.msg))
+
+
+def cmd_task(a):
+    root = repo_root()
+    t = all_tasks(root).get(a.task) or die(f"unknown task {a.task}")
+    ts = state(root)["tasks"].get(a.task, {})
+    print(json.dumps({"task": t, "state": {k: v for k, v in ts.items() if k != "history"},
+                      "history": ts.get("history", [])[-5:]}, indent=2))
+
+
+def cmd_lane(a):
+    root = repo_root()
+    if a.set:
+        if a.set not in LANES:
+            die("lane must be S, M or L")
+        cfg = load_json(root / ".pumori" / "run.json", {})
+        cfg["lane"] = a.set
+        save_json(root / ".pumori" / "run.json", cfg)
+        log(root, f"lane set to {a.set}", "orchestrator")
+    lane, prof = lane_of(root)
+    out({"lane": lane, **prof}, a.json)
+
+
+def cmd_check_spec(a):
+    root = repo_root()
+    lane, prof = lane_of(root)
+    reqs = active_reqs(root)
+    nfr = root / ".pumori" / "spec" / "nfr.md"
+    res = {"lane": lane, "requirements": len(reqs), "budget": prof["max_reqs"],
+           "verdict": "PASS" if len(reqs) <= prof["max_reqs"] else "FAIL",
+           "hint": "" if len(reqs) <= prof["max_reqs"] else
+           "merge or cut requirements: keep only what the PRD asks for (move extras to non-goals)",
+           "nfr_lines": len(nfr.read_text().splitlines()) if nfr.exists() else 0}
+    out(res, a.json)
+    sys.exit(0 if res["verdict"] == "PASS" else 1)
+
+
+def cmd_resolve(a):
+    root = repo_root()
+    with Locked(root):
+        st = state(root)
+        ts = st["tasks"].get(a.task) or die(f"unknown task {a.task}")
+        ts.setdefault("history", []).append({"resolve": a.action, "note": a.note, "at": now()})
+        if a.action == "retry":
+            ts.update({"status": "todo", "rounds": 0, "instruction": a.note or ts.get("instruction", "")})
+        elif a.action == "drop":
+            ts["status"] = "dropped"
+        elif a.action == "merged":
+            # the task's code is already on main (e.g. a check reopened it after merging): prove it with
+            # its own tests on main instead of re-reviewing a branch that may be gone
+            t = all_tasks(root).get(a.task) or die(f"unknown task {a.task}")
+            files = [f for f in runnable(root, t.get("test_files", [])) if (root / f).exists()]
+            r = run_stack(root, "verify_tests", root, files) if files else run_stack(root, "verify_quick", root)
+            if not r["ok"]:
+                save_state(root, st)
+                die(f"{a.task}'s tests fail on main, so it is not done; use retry. Output:\n{r['output'][-1500:]}")
+            ts.update({"status": "passed", "passed_at": now(), "rounds": ts.get("rounds", 0),
+                       "merged_sha": git(["rev-parse", "HEAD"], root).stdout.strip()})
+            ts.pop("instruction", None)
+        save_state(root, st)
+    log(root, f"{a.task} resolved: {a.action}{' — ' + a.note if a.note else ''}", "orchestrator")
+    print(json.dumps({"ok": True, "task": a.task, "status": state(root)["tasks"][a.task]["status"]}))
+
+
+def amend_files(root, ident):
+    if ident == "baseline":
+        return [f for f in baseline_tests(root)]
+    if ident == "config":  # test runner configs: same reviewed path as protected tests, no human wait
+        return runner_configs(root)
+    t = all_tasks(root).get(ident) or die(f"unknown task {ident}")
+    return t.get("test_files", [])
+
+
+def cmd_amend_test(a):
+    """The only way a protected test changes: Test Designer edits, Reviewer approves this exact diff, CLI commits."""
+    root = repo_root()
+    files = amend_files(root, a.target)
+    changed = [l.strip() for l in git(["diff", "--name-only", "HEAD"], root).stdout.splitlines() if l.strip()]
+    changed += [l[3:] for l in git(["status", "--porcelain"], root).stdout.splitlines() if l.startswith("??") and l[3:] in files]
+    outside = [f for f in changed if f not in files and not f.startswith(".pumori/")]
+    if outside:
+        die(f"uncommitted changes outside the protected tests of {a.target}: {outside[:5]}")
+    diff = git(["diff", "HEAD", "--", *files], root).stdout
+    if not diff.strip():
+        die("nothing to amend")
+    rv = state(root).get("test_reviews", {}).get(a.target) or {}
+    if rv.get("verdict") != "APPROVE" or rv.get("diff_sha") != hashlib.sha1(diff.encode()).hexdigest():
+        die("needs a reviewer APPROVE for exactly this diff: `pumori record test-review <target>`")
+    with Locked(root):
+        git(["add", "--", *[f for f in files if (root / f).exists() or f in changed]], root, check=True)
+        git(["-c", "user.name=Pumori", "-c", "user.email=pumori@localhost", "commit", "-qm",
+             f"test(amend {a.target}): {a.reason}"], root, check=True)
+        if a.target == "baseline":
+            save_json(rt(root) / "baseline-tests.json", files)
+    log(root, f"protected tests amended for {a.target}: {a.reason}", "test-designer")
+    print(json.dumps({"ok": True, "target": a.target}))
+
+
+def sweep_dbs(root, everything=False):
+    """Drop leftover test DBs (stack command). Never touches the app, template or staging DBs."""
+    key = "db_sweep_all" if everything else "db_sweep"
+    if key not in stack_cfg(root).get("commands", {}):
+        return {"ok": True, "skipped": "stack has no " + key}
+    r = run_stack(root, key, root, timeout=120)
+    m = re.search(r"\{.*\}", r["output"], re.S)
+    data = json.loads(m.group(0)) if r["ok"] and m else {}
+    if data.get("dropped"):
+        log(root, f"dropped {len(data['dropped'])} leftover test DB(s)", "pumori")
+    return {"ok": r["ok"], "dropped": data.get("dropped", []), **({} if r["ok"] else {"output": r["output"][-800:]})}
+
+
+def cmd_clean_dbs(a):
+    print(json.dumps(sweep_dbs(repo_root(), a.all), indent=2))
+
+
+def cmd_boot(a):
+    root = repo_root()
+    cmds = stack_cfg(root)["commands"]
+    key = "stop" if a.action == "stop" else ("qa_boot" if "qa_boot" in cmds else "init")
+    with Locked(root):  # the production build reads main; no merge may land mid-build
+        r = run_stack(root, key, root, timeout=900)
+    print(json.dumps({"ok": r["ok"], "command": cmds[key], "output": r["output"][-2500:]}, indent=2))
+    sys.exit(0 if r["ok"] else 1)
+
+
+def cmd_event(a):
+    root = repo_root()
+    log(root, " ".join(a.msg), a.role)
+
+
+def cmd_roster(a):
+    """Role sessions of this run (sessions mode): who is who, by session id."""
+    root = repo_root()
+    path = rt(root) / "roster.json"
+    with Locked(root):
+        r = load_json(path, {})
+        if a.action == "set":
+            if not a.role or not a.session:
+                die("usage: pumori roster set <role> <session_id> [--title T]")
+            r[a.role] = {"session": a.session, "title": a.title or a.role, "since": now()}
+            save_json(path, r)
+            log(root, f"role session {a.role} = {a.session}", "orchestrator")
+        elif a.action == "clear" and a.role:
+            r.pop(a.role, None)
+            save_json(path, r)
+    print(json.dumps(r, indent=2))
+
+
+def run_metrics(root):
+    """Process metrics for comparing Pumori versions across runs (one run is one sample: compare averages)."""
+    st = state(root)
+    tasks = all_tasks(root)
+    evs = []
+    ep = rt(root) / "events.jsonl"
+    if ep.exists():
+        for line in ep.read_text().splitlines():
+            try:
+                evs.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    T = lambda e: dt.datetime.fromisoformat(e["at"])
+    # time starts when the orchestrator starts (not when the project folder was created)
+    first = next((i for i, e in enumerate(evs) if e.get("role") == "orchestrator"), 0)
+    evs_run = evs[first:]
+    active, human_wait, long_gaps = 0.0, 0.0, []
+    for a1, b1 in zip(evs_run, evs_run[1:]):
+        gap = (T(b1) - T(a1)).total_seconds()
+        # waits on the human are marked by the orchestrator ("WAIT human: ...") or are > 60 min (overnight,
+        # a paused session). Long gaps inside work (a hung command) count as work: they're the factory's cost.
+        if a1["msg"].startswith("WAIT human") or gap > 60 * 60:
+            human_wait += gap
+            continue
+        active += gap
+        if gap > 10 * 60:
+            long_gaps.append({"after": a1["msg"][:100], "minutes": round(gap / 60, 1)})
+    stages = {}
+    for e in evs:
+        if e["msg"].startswith("stage → "):
+            stages[e["msg"][8:]] = e["at"]
+    def mins(a2, b2):
+        return round((dt.datetime.fromisoformat(stages[b2]) - dt.datetime.fromisoformat(stages[a2])).total_seconds() / 60, 1) \
+            if a2 in stages and b2 in stages else None
+    count = lambda needle: sum(1 for e in evs if needle in e["msg"])
+    starts = collections.Counter(re.match(r"(T\d+) round", e["msg"]).group(1) for e in evs
+                                 if re.match(r"T\d+ round \d+ started", e["msg"]))  # survives resets
+    rounds = [starts.get(t, 0) for t in tasks if starts.get(t, 0)]
+    return {
+        "active_minutes": round(active / 60, 1),
+        "human_wait_minutes": round(human_wait / 60, 1),
+        "long_gaps": long_gaps[:10],
+        "prebuild_minutes": mins("questions", "build"),
+        "build_to_release_minutes": mins("build", "accept"),
+        "red_check_rejections": count("red check rejected"),
+        "test_amendments": count("protected tests amended"),
+        "gate_failures": count("gate FAIL"),
+        "milestone_check_reopens": count("browser check FAIL"),
+        "qa_cycles": sum(m.get("qa_cycles", 0) for m in st["milestones"].values()),
+        "unstick_decisions": count("conductor recorded"),
+        "avg_rounds_per_task": round(sum(rounds) / len(rounds), 2) if rounds else None,
+        "tasks_first_round": sum(1 for r in rounds if r == 1),
+        "requirements": len(active_reqs(root)),
+        "lane": lane_of(root)[0],
+    }
+
+
+def cmd_bench_score(a):
+    root = repo_root()
+    d = status_data(root)
+    js = journeys(root)
+    st = state(root)
+    sat = sum(1 for j in js if st["journeys"].get(j["id"], {}).get("satisfied"))
+    res = {"at": now(), "label": a.label, "project": d["project"],
+           "journey_pass_rate": round(sat / len(js), 3) if js else None,
+           "tasks_passed": d["tasks"].get("passed", 0), "tasks_total": d["total_tasks"],
+           "rounds": d["rounds"], "budget_units": d["budget"]["units"], "stage": d["stage"],
+           "plugin_version": load_json(PLUGIN_ROOT / ".claude-plugin" / "plugin.json", {}).get("version"),
+           **run_metrics(root),
+           "pumori_commit": git(["rev-parse", "--short", "HEAD"], PLUGIN_ROOT.parent).stdout.strip()}
+    (HOME / "bench").mkdir(parents=True, exist_ok=True)
+    with open(HOME / "bench" / "results.jsonl", "a") as f:
+        f.write(json.dumps(res) + "\n")
+    print(json.dumps(res, indent=2))
+
+
+RISKY_RE = re.compile(r"auth|session|password|login|signup|permission|admin|migrat|drizzle/|schema\.(ts|sql)|"
+                      r"delete|payment|billing|money|invite|token|secret|env\.ts", re.I)
+
+
+def cmd_release(a):
+    """Release without an agent: every fact in the handoff comes from recorded run state, so nothing is invented."""
+    root = repo_root()
+    cfg = run_cfg(root)
+    st = state(root)
+    tasks = all_tasks(root)
+    lane, prof = lane_of(root)
+    stack = stack_cfg(root)
+    checks = []
+    key = "verify_release" if "verify_release" in stack["commands"] else "verify"
+    full = run_stack(root, key, root, timeout=3600)
+    checks.append(("Release verify (types, lint + coding rules, unit, browser on a production build, security)"
+                   if key == "verify_release" else "Full verify (types, lint + coding rules, unit, browser, security)", full["ok"],
+                   full["output"].splitlines()[-12:]))
+    docker = run(["docker", "info"], timeout=20).returncode == 0 if shutil.which("docker") else False
+    staging = None
+    if docker and "staging_up" in stack["commands"] and not a.dry_run:
+        r = run_stack(root, "staging_up", root, timeout=1800)
+        staging = {"ok": r["ok"], "output": r["output"][-1200:]}
+    ports = cfg.get("ports", {})
+    fmt = lambda u: u.format(**{**ports, "STAGING_WEB_PORT": int(ports.get("WEB_PORT", 0) or 0) + 1000})
+    urls = {k: fmt(v) for k, v in stack.get("urls", {}).items()} if ports else {}
+    reqs = sorted(active_reqs(root), key=lambda r: int(r.split("-")[1]))
+    cover = {r: [tid for tid, t in tasks.items() if r in t.get("criteria", [])] for r in reqs}
+    js = journeys(root)
+    qa_files = sorted(glob.glob(str(rt(root) / "qa" / "*" / "cycle-*.json")))
+    gaps = []
+    for f in qa_files[-1:]:
+        for b in load_json(f, {}).get("bugs", []):
+            gaps.append(f"{b.get('severity', '?')}: {b.get('title', '')}")
+    base = git(["rev-list", "--max-parents=0", "HEAD"], root).stdout.split()[0]
+    changed = git(["diff", "--name-only", base, "HEAD"], root).stdout.split()
+    risky = [f for f in changed if RISKY_RE.search(f) and not globs_match(f, stack.get("test_globs", []))]
+    b = budget_info(root)
+    rounds = sum(st["tasks"].get(t, {}).get("rounds", 0) for t in tasks)
+    L = [f"# HANDOFF · {cfg.get('project')}", "",
+         f"Built by Pumori ({stack.get('name')}, lane {lane}) on {now()[:10]}. "
+         f"Every fact below comes from the run's recorded state.", "",
+         "## Run it", ""]
+    L += [f"- `{stack['commands'].get('init', './init.sh')}`: start locally"] + [f"- {k}: {u}" for k, u in urls.items()]
+    if staging:
+        L.append(f"- Staging: {'up' if staging['ok'] else 'FAILED'} ({urls.get('staging_web', '')})")
+    else:
+        L.append("- Staging: skipped. Docker isn't running" + (" (dry run)" if a.dry_run else "") +
+                 f"; start Docker Desktop, then `{stack['commands'].get('staging_up', './staging.sh up')}`.")
+    L += ["", "## What was built", "", "| Task | Area | What | Rounds |", "|---|---|---|---|"]
+    for tid, t in tasks.items():
+        ts = st["tasks"].get(tid, {})
+        L.append(f"| {tid} | {t.get('area', '')} | {t['title']} | {ts.get('rounds', 0)} ({ts.get('status', 'todo')}) |")
+    L += ["", f"## Requirements ({len(reqs)})", ""]
+    L += [f"- {r}: " + (", ".join(cover[r]) if cover[r] else "**not covered**") for r in reqs]
+    L += ["", "## Verification", ""]
+    for name, ok, tail in checks:
+        L.append(f"- {name}: **{'PASS' if ok else 'FAIL'}**")
+    sat = [j for j in js if st["journeys"].get(j["id"], {}).get("satisfied")]
+    L.append(f"- Hidden user journeys: **{len(sat)}/{len(js)}** satisfied (3 independent judge votes each)")
+    L.append(f"- QA cycles: {sum(m.get('qa_cycles', 0) for m in st['milestones'].values())}")
+    L += ["", "## Review these first (risky areas changed in this run)", ""]
+    L += [f"- `{f}`" for f in risky] or ["- none detected"]
+    for mid, mv in st["milestones"].items():
+        acc = mv.get("accepted")
+        if acc:
+            still = [j for j in acc.get("journeys", []) if not st["journeys"].get(j, {}).get("satisfied")]
+            gaps.append(f"{mid} closed by human decision with QA {acc.get('qa_was')}" +
+                        (f"; journeys still unsatisfied: {', '.join(still)}" if still else "") + f" ({acc.get('reason')})")
+    L += ["", "## Cost by role", "", "| Role | Units | Share |", "|---|---|---|"] + \
+        [f"| {r['role']} | {r['units'] / 1e6:.1f}M | {r['share']}% |" for r in cost_by_role(root)[:12]]
+    L += ["", "## Known gaps", ""] + ([f"- {g}" for g in gaps] or ["- none recorded by QA"])
+    L += ["", "## Effort", "", f"- Budget: {b['units']:,} units ({b['pct']}% of cap); fix rounds: {rounds}", "",
+          "## Next", "", "- Request changes with `/pumori:change \"…\"`.",
+          "- Production deploys are yours; the factory never deploys to production."]
+    text = "\n".join(L) + "\n"
+    if a.dry_run:
+        print(text)
+        print(json.dumps({"ok": full["ok"], "dry_run": True}))
+        return
+    (root / "HANDOFF.md").write_text(text)
+    with Locked(root):
+        git(["add", "HANDOFF.md"], root, check=True)
+        git(["-c", "user.name=Pumori", "-c", "user.email=pumori@localhost", "commit", "-qm", "release: handoff"], root)
+    log(root, f"release: verify {'PASS' if full['ok'] else 'FAIL'}, staging {'up' if staging and staging['ok'] else 'skipped'}", "release")
+    swept = sweep_dbs(root, everything=True)  # handover: only the app, template and staging DBs remain
+    print(json.dumps({"ok": full["ok"], "handoff": str(root / "HANDOFF.md"), "staging": bool(staging and staging["ok"]),
+                      "risky_files": len(risky), "verify_tail": full["output"][-800:]}, indent=2))
+    sys.exit(0 if full["ok"] else 1)
+
+
+def cmd_bench_setup(a):
+    bdir = next((d for d in [PLUGIN_ROOT / "benchmarks", PLUGIN_ROOT.parent / "benchmarks"] if (d / a.bench).is_dir()), None)
+    if not bdir:
+        die(f"benchmark {a.bench} not found")
+    b = bdir / a.bench
+    name = f"bench-{a.bench.lower()}-{a.label}".strip("-")
+    ns = argparse.Namespace(name=name, prd=str(b / "prd.md"), stack=a.stack, dir=a.dir, budget=a.budget)
+    import contextlib, io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cmd_new(ns)
+    info = json.loads(buf.getvalue())
+    dest = pathlib.Path(info["dir"])
+    scen = HOME / "scenarios" / info["project"]
+    for j in sorted((b / "journeys").glob("SC-*.md")):
+        shutil.copy(j, scen / j.name)
+    if (b / "answers.md").exists():
+        shutil.copy(b / "answers.md", dest / ".pumori" / "answers.md")
+    save_json(dest / ".pumori" / "autopilot.json", {"answers_file": ".pumori/answers.md", "approve_spec": True,
+                                                     "variant": "a", "accept": True, "fixed_journeys": True})
+    git(["add", "-A"], dest, check=True)
+    git(["-c", "user.name=Pumori", "-c", "user.email=pumori@localhost", "commit", "-qm", f"bench setup {a.bench}"], dest, check=True)
+    print(json.dumps({**info, "benchmark": a.bench, "journeys": len(list(scen.glob("SC-*.md")))}, indent=2))
+
+
+# ---------- Claude Code hooks ----------
+WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+READ_TOOLS = {"Read", "Grep", "Glob"}
+SCENARIO_ROLES = {"pumori:pm", "pumori:planner", "pumori:qa", "pumori:judge"}
+STATE_FILES = re.compile(r"\.pumori/runtime/(state\.json|progress\.log|verdicts|baseline-tests\.json|budget)")
+
+
+def deny(reason):
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                             "permissionDecisionReason": f"[pumori] {reason}"}}))
+    sys.exit(0)
+
+
+PUMORI_SRC = PLUGIN_ROOT.parent
+SYSTEM_CMDS = re.compile(r"\bopen\s+-a\b|\bosascript\b|\blaunchctl\b|\bbrew\s+(services|install|upgrade)\b|"
+                         r"\bsudo\b|\bpg_ctl\b|postgresql\.conf|pg_hba\.conf")
+
+
+def hook_pretool(data):
+    tool = data.get("tool_name", "")
+    ti = data.get("tool_input") or {}
+    agent = data.get("agent_type") or ""
+    cwd = data.get("cwd") or os.getcwd()
+    try:
+        root = repo_root(cwd)
+    except SystemExit:
+        return  # not a Pumori project: never interfere
+    text = json.dumps(ti)
+    scen = str(HOME / "scenarios")
+    # 0. Pumori's own source is read-only from inside project runs
+    if str(PUMORI_SRC) in text and not str(cwd).startswith(str(PUMORI_SRC)):
+        cmd0 = re.sub(r"\d?>&?\s*/dev/null|2>&1", "", ti.get("command", ""))  # stderr/null redirects aren't writes
+        if tool in WRITE_TOOLS or (tool == "Bash" and re.search(r"(>|\bsed\s+-i|\btee\b|\bcp\b|\bmv\b|\brm\b|\bpatch\b|python3?\s+-)",
+                                                               cmd0)):
+            deny("Pumori's source is read-only from a project run; report the problem in your summary instead")
+    # 1. hidden journeys: only PM writes them, only QA/Judge read them (PM not at all when journeys are fixed)
+    if scen in text or "pumori-home/scenarios" in text:
+        if agent not in SCENARIO_ROLES:
+            deny("hidden user journeys are only visible to the PM, QA and Judge roles")
+        if tool in WRITE_TOOLS and agent not in ("pumori:pm", "pumori:planner"):
+            deny("only the PM (or Planner) writes journeys")
+        if agent in ("pumori:pm", "pumori:planner") and (load_json(root / ".pumori" / "autopilot.json", {}) or {}).get("fixed_journeys"):
+            deny("journeys are fixed for this run; the PM must not read or write them (keeps the score honest)")
+    # 2. run state is owned by the pumori CLI
+    target = ti.get("file_path") or ti.get("notebook_path") or ""
+    if tool in WRITE_TOOLS and STATE_FILES.search(target):
+        deny("run state is written only by the `pumori` command")
+    if tool == "Bash":
+        cmd = ti.get("command", "")
+        if STATE_FILES.search(cmd) and not re.match(r"^\s*(pumori|cat|jq|head|tail|less|ls)\b", cmd):
+            deny("run state is written only by the `pumori` command")
+        if agent.startswith(ROLE_PREFIX) and re.search(r"\bgit\s+push\b", cmd):
+            deny("agents never push; the human owns remotes")
+        if SYSTEM_CMDS.search(cmd):
+            deny("starting apps/services or changing system or Postgres config is the human's call; report what is needed")
+        if agent in DEV_ROLES and re.search(
+                r"\bgit\s+(merge|rebase\s+-i|reset\s+--hard\s+main|checkout\s+main|switch\s+main|branch\s+-[dD])\b", cmd):
+            deny("developers commit on their task branch only; `pumori gate` does merges")
+        if agent in DEV_ROLES and re.search(r"\bpumori\s+(gate|record|add-tasks|commit-tests|milestone-close|stage)\b", cmd):
+            deny("developers may only run `pumori start-task` and `pumori handoff`")
+        if agent in ("pumori:reviewer", "pumori:judge") and re.search(r"\bgit\s+(commit|merge|reset|checkout\s+-b)\b|\brm\s+-", cmd):
+            deny("reviewers and judges are read-only")
+    # 3. role-based write rules
+    if tool in WRITE_TOOLS and target:
+        tpath = pathlib.Path(target if os.path.isabs(target) else os.path.join(cwd, target)).resolve()
+        probe = tpath.parent
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        try:
+            rel = str(tpath.relative_to(checkout_root(str(probe))))
+        except ValueError:
+            rel = target
+        tglobs = stack_cfg(root).get("test_globs", [])
+        is_test = globs_match(rel, tglobs)
+        if is_runner_config(rel) and agent and agent.startswith("pumori:") and agent != "pumori:test-designer":
+            deny(f"{rel} is a test runner config. It changes only through `pumori amend-test config` (the Test "
+                 "Designer edits it on main, the Reviewer approves). Put the needed change in your handoff (not_done).")
+        own_amends = []
+        if agent in DEV_ROLES:
+            st_h = state(root)
+            for tid_h, ts_h in st_h["tasks"].items():
+                wt_h = ts_h.get("worktree")
+                if wt_h and str(tpath).startswith(str(pathlib.Path(wt_h).resolve()) + os.sep):
+                    own_amends = all_tasks(root).get(tid_h, {}).get("amends_tests", [])
+                    break
+        if rel in set(protected_tests(root)) and agent != "pumori:test-designer" and rel not in own_amends:
+            deny(f"{rel} is a protected test. Only the Test Designer may change it, through "
+                 "`pumori amend-test` after a reviewer approves the diff. Explain the problem instead.")
+        if agent in ("pumori:frontend-dev", "pumori:backend-dev"):
+            areas = stack_cfg(root).get("areas", {})
+            fence = {"pumori:frontend-dev": ["backend", "contract"], "pumori:backend-dev": ["frontend"]}[agent]
+            if any(globs_match(rel, areas.get(x, {}).get("paths", [])) for x in fence) and not is_test:
+                deny(f"{rel} belongs to another specialist's area ({'/'.join(fence)}). Note the needed change in your "
+                     "handoff (not_done); the architect will plan it.")
+        if agent in DEV_ROLES:
+            if rel.startswith(".pumori/") or rel in ("AGENTS.md", "CLAUDE.md"):
+                deny("spec, plan and rules are owned by PM/Architect; note needed changes in your handoff")
+        if agent == "pumori:test-designer" and not is_test and not is_runner_config(rel) \
+                and not rel.startswith(".pumori/runtime/prewrite/"):
+            deny(f"test designers write only test files ({', '.join(tglobs[:3])}…)")
+        if agent == "pumori:designer":
+            allowed = [".pumori/**", "docs/**"] + stack_cfg(root).get("designer_paths", [])
+            if not globs_match(rel, allowed):
+                deny(f"{rel}: the Designer changes product code and styles only through a task (direct commits to main broke "
+                     "tests in CR-1). Write mockups and docs; put the change you want in chosen.md for the Architect to plan.")
+        if agent in ("pumori:reviewer", "pumori:judge"):
+            deny("this role is read-only")
+        if agent == "pumori:qa" and not rel.startswith(".pumori/runtime/qa"):
+            deny("QA writes only under .pumori/runtime/qa/ (reports, scratch scripts, screenshots)")
+    # 4. budget guard (only for Pumori role agents, so the human session is never locked out)
+    if agent.startswith(ROLE_PREFIX) and data.get("transcript_path"):
+        b = budget_info(root, data["transcript_path"])
+        if b["over"]:
+            deny(f"run budget reached ({b['units']:,}/{b['cap']:,} units). Stop now and report what is done.")
+
+
+def hook_subagent_stop(data):
+    agent = data.get("agent_type") or ""
+    cwd = data.get("cwd") or os.getcwd()
+    if agent not in DEV_ROLES:
+        return
+    try:
+        root = repo_root(cwd)
+    except SystemExit:
+        return
+    here = str(checkout_root(cwd))
+    st = state(root)
+    task = next((tid for tid, s in st["tasks"].items() if s.get("worktree") == here and s.get("status") == "in_progress"), None)
+    if not task:
+        return
+    ts = st["tasks"][task]
+    head = git(["rev-parse", "HEAD"], here).stdout.strip()
+    if ts.get("handoff_sha") == head:
+        return  # handoff recorded for the final commit (pass or honest fail)
+    marker = rt(root) / "stop-attempts" / f"{data.get('agent_id', 'x')}"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    n = int(marker.read_text()) if marker.exists() else 0
+    if n >= 2:
+        return
+    marker.write_text(str(n + 1))
+    print(json.dumps({"decision": "block", "reason":
+                      f"[pumori] Before stopping: commit your work and run `pumori handoff {task}` with your "
+                      "handoff JSON on stdin. It runs the task's tests; fix failures (or report them honestly "
+                      "in not_done) and hand off again."}))
+
+
+def cmd_hook(a):
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        return
+    try:
+        if a.name == "pretool":
+            hook_pretool(data)
+        elif a.name == "subagent-stop":
+            hook_subagent_stop(data)
+    except SystemExit:
+        raise
+    except Exception as e:  # a broken hook must never wedge the session
+        print(f"pumori hook error (ignored): {e}", file=sys.stderr)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="pumori", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("new"); s.add_argument("name"); s.add_argument("--prd", required=True)
+    s.add_argument("--stack", default=DEFAULTS["default_stack"]); s.add_argument("--dir"); s.add_argument("--budget", type=int)
+    s.add_argument("--brand", help="brand name in $PUMORI_HOME/brands, or a brand folder")
+    s = sub.add_parser("brand"); s.add_argument("action", choices=["list", "apply"]); s.add_argument("name", nargs="?")
+    s = sub.add_parser("adopt"); s.add_argument("--stack-file")
+    s = sub.add_parser("next"); s.add_argument("--json", action="store_true")
+    s.add_argument("--building", action="store_true", help="a build is running: return only check/QA/close work (or wait)")
+    s = sub.add_parser("stage"); s.add_argument("name")
+    s = sub.add_parser("validate-plan"); s.add_argument("--json", action="store_true")
+    s = sub.add_parser("commit-docs"); s.add_argument("-m", required=True)
+    s = sub.add_parser("commit-tests"); s.add_argument("milestone"); s.add_argument("--tasks")
+    s = sub.add_parser("start-task"); s.add_argument("task")
+    s = sub.add_parser("handoff"); s.add_argument("task")
+    s = sub.add_parser("record"); s.add_argument("kind"); s.add_argument("ident")
+    s = sub.add_parser("gate"); s.add_argument("task")
+    sub.add_parser("add-tasks")
+    s = sub.add_parser("journeys"); s.add_argument("--ready", action="store_true"); s.add_argument("--json", action="store_true")
+    s = sub.add_parser("milestone-close"); s.add_argument("milestone")
+    s = sub.add_parser("milestone-accept", help="human decision: close a built milestone with its QA/journey gaps as known gaps")
+    s.add_argument("milestone"); s.add_argument("--reason", required=True)
+    s = sub.add_parser("ready", help="tasks of a milestone whose deps have merged (rolling scheduling)")
+    s.add_argument("milestone"); s.add_argument("--exclude", default=""); s.add_argument("--limit", default="6")
+    s = sub.add_parser("flaky", help="list quarantined flaky tests, or mark one fixed")
+    s.add_argument("action", nargs="?", default="list", choices=["list", "fixed"]); s.add_argument("id", nargs="?")
+    s.add_argument("--note", default="")
+    s = sub.add_parser("cost", help="budget units per role for this run"); s.add_argument("--json", action="store_true")
+    s = sub.add_parser("clean-dbs", help="drop leftover test DBs (--all: every test DB, at handover)")
+    s.add_argument("--all", action="store_true")
+    s = sub.add_parser("qa-mark", help="qa-mark <start|end> <milestone>: QA running, so later milestones build alongside")
+    s.add_argument("which", choices=["start", "end"]); s.add_argument("milestone")
+    s = sub.add_parser("budget"); s.add_argument("--json", action="store_true")
+    s = sub.add_parser("status"); s.add_argument("--json", action="store_true"); s.add_argument("--html", action="store_true")
+    s = sub.add_parser("log"); s.add_argument("msg", nargs="+")
+    s = sub.add_parser("task"); s.add_argument("task")
+    s = sub.add_parser("lane"); s.add_argument("set", nargs="?"); s.add_argument("--json", action="store_true")
+    s = sub.add_parser("check-spec"); s.add_argument("--json", action="store_true")
+    s = sub.add_parser("milestone-check"); s.add_argument("milestone")
+    s = sub.add_parser("resolve"); s.add_argument("task"); s.add_argument("action", choices=["retry", "drop", "merged"]); s.add_argument("--note", default="")
+    s = sub.add_parser("amend-test"); s.add_argument("target"); s.add_argument("--reason", required=True)
+    s = sub.add_parser("release"); s.add_argument("--dry-run", action="store_true")
+    s = sub.add_parser("boot"); s.add_argument("action", nargs="?", default="start", choices=["start", "stop"])
+    s = sub.add_parser("event"); s.add_argument("role"); s.add_argument("msg", nargs="+")
+    s = sub.add_parser("roster"); s.add_argument("action", nargs="?", default="show", choices=["show", "set", "clear"])
+    s.add_argument("role", nargs="?"); s.add_argument("session", nargs="?"); s.add_argument("--title")
+    s = sub.add_parser("bench-score"); s.add_argument("--label", default="")
+    s = sub.add_parser("bench-setup"); s.add_argument("bench"); s.add_argument("label")
+    s.add_argument("--stack", default=DEFAULTS["default_stack"]); s.add_argument("--dir"); s.add_argument("--budget", type=int)
+    s = sub.add_parser("hook"); s.add_argument("name")
+    a = ap.parse_args()
+    fn = {"new": cmd_new, "adopt": cmd_adopt, "next": cmd_next, "stage": cmd_stage, "validate-plan": cmd_validate_plan,
+          "commit-docs": cmd_commit_docs, "commit-tests": cmd_commit_tests, "start-task": cmd_start_task,
+          "handoff": cmd_handoff, "record": cmd_record, "gate": cmd_gate, "add-tasks": cmd_add_tasks,
+          "journeys": cmd_journeys, "milestone-close": cmd_milestone_close, "milestone-accept": cmd_milestone_accept, "clean-dbs": cmd_clean_dbs, "cost": cmd_cost, "brand": cmd_brand, "flaky": cmd_flaky, "ready": cmd_ready, "qa-mark": cmd_qa_mark, "budget": cmd_budget,
+          "status": cmd_status, "log": cmd_log, "event": cmd_event, "task": cmd_task, "lane": cmd_lane, "check-spec": cmd_check_spec,
+          "milestone-check": cmd_milestone_check, "resolve": cmd_resolve, "amend-test": cmd_amend_test, "boot": cmd_boot, "release": cmd_release, "roster": cmd_roster, "bench-score": cmd_bench_score, "bench-setup": cmd_bench_setup,
+          "hook": cmd_hook}[a.cmd]
+    fn(a)
+
+
+if __name__ == "__main__":
+    main()

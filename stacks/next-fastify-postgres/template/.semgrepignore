@@ -1,0 +1,10 @@
+.claude/
+.pumori/
+node_modules/
+.next/
+.next-e2e/
+.next-release/
+test-results/
+playwright-report/
+.verify/
+.run/

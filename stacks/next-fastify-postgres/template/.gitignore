@@ -1,0 +1,17 @@
+node_modules/
+.env
+.env.*
+!.env.example
+.run/
+.verify/
+.next/
+.next-e2e/
+.next-release/
+next-env.d.ts
+dist/
+*.tsbuildinfo
+test-results/
+playwright-report/
+blob-report/
+.claude/worktrees/
+.DS_Store

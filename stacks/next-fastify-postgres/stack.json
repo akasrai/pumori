@@ -1,0 +1,103 @@
+{
+  "name": "next-fastify-postgres",
+  "description": "pnpm monorepo: Next.js 16 (App Router) web + Fastify 5 API + Postgres 16 via Drizzle ORM, shared zod contracts, email/password session auth, Vitest + Playwright, single ./verify gate, Docker staging against host Postgres.",
+  "runtime": {
+    "node": "22",
+    "path_prepend": [
+      "/opt/homebrew/opt/node@22/bin"
+    ]
+  },
+  "commands": {
+    "init": "./init.sh",
+    "stop": "./init.sh stop",
+    "status": "./init.sh status",
+    "verify": "./verify",
+    "verify_quick": "./verify --quick",
+    "verify_tests": "./verify --tests {files}",
+    "verify_e2e": "./verify --e2e",
+    "verify_security": "./verify --security",
+    "verify_release": "./verify --release",
+    "staging_up": "./staging.sh up",
+    "staging_down": "./staging.sh down",
+    "qa_boot": "./init.sh --prod",
+    "db_sweep": "node --disable-warning=ExperimentalWarning apps/api/scripts/testdb.ts sweep",
+    "db_sweep_all": "node --disable-warning=ExperimentalWarning apps/api/scripts/testdb.ts sweep --all"
+  },
+  "urls": {
+    "web": "http://localhost:{WEB_PORT}",
+    "api": "http://localhost:{API_PORT}",
+    "staging_web": "http://localhost:{STAGING_WEB_PORT}"
+  },
+  "test_globs": [
+    "apps/*/test/**",
+    "e2e/**",
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "**/*.spec.ts"
+  ],
+  "test_naming": {
+    "api": "apps/api/test/{task}-{slug}.test.ts",
+    "web": "apps/web/test/{task}-{slug}.test.tsx",
+    "e2e": "e2e/{task}-{slug}.spec.ts"
+  },
+  "skip_marker_regex": "\\b(it|test|describe)\\.(skip|only|todo|fixme)\\b|\\bx(it|describe)\\(",
+  "assert_regex": "\\bexpect\\(|\\bassert\\b",
+  "placeholders": [
+    "PROJECT",
+    "DB_NAME",
+    "API_PORT",
+    "WEB_PORT",
+    "APP_NAME"
+  ],
+  "conventions_doc": "docs/conventions.md",
+  "design_doc": "docs/design.md",
+  "ui_gallery": "/dev/ui",
+  "e2e_globs": [
+    "e2e/**"
+  ],
+  "runnable_test_regex": "\\.(test|spec)\\.[cm]?[jt]sx?$",
+  "areas": {
+    "contract": {
+      "label": "shared API contracts, DB schema and migrations, component stubs",
+      "paths": [
+        "packages/shared/**",
+        "apps/api/src/db/**",
+        "apps/api/drizzle/**"
+      ]
+    },
+    "backend": {
+      "label": "Fastify API: routes, services, authorization",
+      "paths": [
+        "apps/api/**"
+      ]
+    },
+    "frontend": {
+      "label": "Next.js web app: pages, components, design system (components/ui), shell, styles",
+      "paths": [
+        "apps/web/**"
+      ]
+    }
+  },
+  "coding_rules_doc": "docs/coding-rules.md",
+  "mockups_dir": "apps/web/app/dev/mockups",
+  "placeholder_files": [
+    "apps/web/lib/app-constants.ts"
+  ],
+  "test_support_globs": [
+    "e2e/support/**",
+    "apps/*/test/support/**"
+  ],
+  "verify_accepts_sources": true,
+  "designer_paths": [
+    "apps/web/app/dev/mockups/**",
+    "apps/web/components/dev/**",
+    "apps/web/app/theme.css",
+    "apps/web/app/fonts/**",
+    "apps/web/public/brand/**"
+  ],
+  "brand_targets": {
+    "theme": "apps/web/app/theme.css",
+    "fonts": "apps/web/app/fonts",
+    "logo": "apps/web/public/brand/logo.svg"
+  }
+}

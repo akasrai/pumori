@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# The single verification command. Output is compact on purpose (it is read by agents):
+# one line per passing step, only the relevant error lines for a failing step, full logs in .verify/.
+#
+#   ./verify                     typecheck → lint/arch → unit tests → e2e → security (runs all steps)
+#   ./verify --quick             typecheck + lint/arch (stops at first failure)
+#   ./verify --tests <file>...   quick checks + only these tests (e2e/*.spec.ts → Playwright, rest → Vitest);
+#                                source files (apps/**, packages/**) run the unit tests that import them (vitest related)
+#   ./verify --e2e               all Playwright tests
+#   ./verify --security          gitleaks + semgrep + pnpm audit (prod, high)
+#   ./verify --release           full verify + production build (next build) + e2e against `next start`
+set -euo pipefail
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/lib.sh"
+cd "$ROOT"
+
+MODE=full
+VITEST_FILES=()
+E2E_FILES=()
+RELATED_FILES=()
+case "${1:-}" in
+  "") ;;
+  --quick) MODE=quick ;;
+  --e2e) MODE=e2e ;;
+  --security) MODE=security ;;
+  --release) MODE=release ;;
+  --tests)
+    MODE=tests
+    shift
+    [ $# -gt 0 ] || die "--tests needs at least one test file"
+    for f in "$@"; do
+      f="${f#"$ROOT"/}"; f="${f#./}"
+      case "$f" in
+        e2e/*.spec.ts) [ -f "$f" ] || die "test file not found: $f"; E2E_FILES+=("$f") ;;
+        apps/*/test/*.test.ts | apps/*/test/*.test.tsx | apps/*/test/*/*.test.ts | apps/*/test/*/*.test.tsx)
+          [ -f "$f" ] || die "test file not found: $f"; VITEST_FILES+=("$f") ;;
+        apps/*.ts | apps/*.tsx | packages/*.ts | packages/*.tsx)
+          # a changed source file: run the unit tests that import it; a deleted file has nothing to run
+          if [ -f "$f" ]; then RELATED_FILES+=("$f"); fi ;;
+        *) die "don't know how to run $f (expected e2e/*.spec.ts, apps/<app>/test/**/*.test.ts[x] or a source file)" ;;
+      esac
+    done
+    ;;
+  -h | --help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) die "unknown option: $1 (see ./verify --help)" ;;
+esac
+
+LOG_DIR="$ROOT/.verify"
+rm -rf "$LOG_DIR"; mkdir -p "$LOG_DIR"
+FAILED=()
+MAX_LINES=60
+
+# ---- error filters: print only what an agent needs to fix the problem ----------------------
+filter_tsc() { grep -E 'error TS[0-9]+' || true; }
+filter_eslint() {
+  sed "s#$ROOT/##" | grep -E '^[^ ].*\.(ts|tsx|js|mjs|cjs)$|^ +[0-9]+:[0-9]+ +(error|warning)|problems?|Error:|Oops' || true
+}
+filter_vitest() {
+  # failing test names, assertion messages, first in-repo stack frame, and the summary
+  grep -E '^ *(FAIL|×|✗) |AssertionError|Error:|TypeError|ReferenceError|Expected|Received|^ *[-+] |❯ [^ ]+\.tsx?:[0-9]+|Test Files|^ *Tests ' \
+    | grep -vE 'node_modules' | awk '!seen[$0]++' || true
+}
+filter_playwright() {
+  grep -E '^ *[0-9]+\) |✘|Error:|Expected|Received|Timeout|waiting for|Call log|^ *> *[0-9]+ \||at (e2e)/[^ ]*:[0-9]+|failed|passed|flaky|Error: |webServer|ERR_' \
+    | grep -vE 'node_modules' | awk '!seen[$0]++' || true
+}
+filter_gitleaks() { grep -E 'Finding:|Secret:|RuleID:|File:|Line:|Commit:|leaks found' || true; }
+filter_semgrep() { grep -vE '^\s*$' || true; }
+filter_audit() { grep -E 'high|critical|Package|Vulnerable|Patched|More info|vulnerabilities' || true; }
+filter_tail() { tail -n 40; }
+
+report_failure() { # <name> <log> <filter>
+  local name="$1" log="$2" filter="$3" out
+  out="$($filter <"$log")"
+  [ -n "$out" ] || out="$(tail -n 40 "$log")"
+  printf '%s\n' "$out" | head -n "$MAX_LINES" | sed 's/^/  /'
+  [ "$(printf '%s\n' "$out" | wc -l)" -le "$MAX_LINES" ] || echo "  … (truncated)"
+  echo "  log: ${log#"$ROOT"/}"
+}
+
+# run_step <name> <filter> <command...>: quiet run, one line on success, filtered errors on failure.
+run_step() {
+  local name="$1" filter="$2"; shift 2
+  local log="$LOG_DIR/$name.log" start end status=0
+  start="$(now)"
+  ( "$@" ) >"$log" 2>&1 || status=$?
+  end="$(now)"
+  if [ "$status" -eq 0 ]; then
+    echo "✓ $name ($(elapsed "$start" "$end")s)"
+    return 0
+  fi
+  echo "✗ $name ($(elapsed "$start" "$end")s)"
+  report_failure "$name" "$log" "$filter"
+  FAILED+=("$name")
+  return 1
+}
+
+finish() {
+  if [ ${#FAILED[@]} -eq 0 ]; then echo "VERIFY PASS"; exit 0; fi
+  echo "VERIFY FAIL: ${FAILED[*]}"; exit 1
+}
+stop_on_failure() { [ "$MODE" = full ] || [ "$MODE" = release ] || finish; }
+
+# ---- steps ---------------------------------------------------------------------------------
+BIN="$ROOT/node_modules/.bin"
+
+step_install() {
+  check_node
+  setup_pnpm
+  ensure_env >/dev/null
+  if [ ! -d node_modules/.pnpm ] || [ pnpm-lock.yaml -nt node_modules/.pnpm/lock.yaml ]; then
+    run_step install filter_tail pnpm install --frozen-lockfile --prefer-offline || finish
+  fi
+}
+
+do_typecheck() {
+  local pids="" rc=0 p
+  "$BIN/tsc" -p tsconfig.json --noEmit --incremental --tsBuildInfoFile node_modules/.cache/tsc/root.tsbuildinfo >"$LOG_DIR/tsc-root.log" 2>&1 & pids="$pids $!"
+  "$BIN/tsc" -p packages/shared --noEmit --incremental --tsBuildInfoFile node_modules/.cache/tsc/shared.tsbuildinfo >"$LOG_DIR/tsc-shared.log" 2>&1 & pids="$pids $!"
+  "$BIN/tsc" -p apps/api --noEmit --incremental --tsBuildInfoFile node_modules/.cache/tsc/api.tsbuildinfo >"$LOG_DIR/tsc-api.log" 2>&1 & pids="$pids $!"
+  ( cd apps/web && ./node_modules/.bin/next typegen >/dev/null && cd "$ROOT" && "$BIN/tsc" -p apps/web --noEmit --incremental --tsBuildInfoFile node_modules/.cache/tsc/web.tsbuildinfo ) >"$LOG_DIR/tsc-web.log" 2>&1 & pids="$pids $!"
+  for p in $pids; do wait "$p" || rc=1; done
+  cat "$LOG_DIR"/tsc-*.log
+  rm -f "$LOG_DIR"/tsc-*.log
+  return $rc
+}
+
+do_lint() { NO_COLOR=1 "$BIN/eslint" --cache --cache-location node_modules/.cache/eslint/ --max-warnings 0 .; }
+
+do_unit() {
+  if [ "$MODE" != tests ] || [ ${#VITEST_FILES[@]} -gt 0 ]; then
+    NO_COLOR=1 FORCE_COLOR=0 "$BIN/vitest" run --reporter=default ${VITEST_FILES[@]+"${VITEST_FILES[@]}"} || return 1
+  fi
+  if [ ${#RELATED_FILES[@]} -gt 0 ]; then
+    NO_COLOR=1 FORCE_COLOR=0 "$BIN/vitest" related --run --passWithNoTests --reporter=default "${RELATED_FILES[@]}"
+  fi
+}
+
+ensure_browsers() {
+  NO_COLOR=1 "$BIN/playwright" install chromium >/dev/null 2>"$LOG_DIR/playwright-install.log" \
+    || { cat "$LOG_DIR/playwright-install.log"; return 1; }
+}
+
+do_e2e() {
+  ensure_browsers
+  export E2E_API_PORT="${E2E_API_PORT:-$(free_port)}"
+  export E2E_WEB_PORT="${E2E_WEB_PORT:-$(free_port)}"
+  [ "$E2E_API_PORT" != "$E2E_WEB_PORT" ] || E2E_WEB_PORT="$(free_port)"
+  NO_COLOR=1 FORCE_COLOR=0 "$BIN/playwright" test --reporter=list ${E2E_FILES[@]+"${E2E_FILES[@]}"}
+}
+
+# Production build for --release: its own dist dir, with the /api rewrite baked in for the e2e API port.
+do_build() {
+  ( cd apps/web && API_PORT="$E2E_API_PORT" NEXT_DIST_DIR=.next-release ./node_modules/.bin/next build )
+}
+
+do_e2e_prod() { E2E_WEB_MODE=prod do_e2e; }
+
+security_step() { # <name> <tool> <filter> <command...>
+  local name="$1" tool="$2"; shift 2
+  if ! command -v "$tool" >/dev/null 2>&1; then echo "- $name skipped ($tool not installed)"; return 0; fi
+  run_step "$name" "$@"
+}
+
+do_gitleaks() {
+  if gitleaks git --help >/dev/null 2>&1; then
+    gitleaks git --no-banner --redact --exit-code 1 "$ROOT"
+  else
+    gitleaks detect --no-banner --redact --exit-code 1 --source "$ROOT"
+  fi
+}
+
+do_semgrep() {
+  local rc=0
+  semgrep scan --config p/typescript --metrics=off --error --quiet --timeout 30 \
+    --exclude 'apps/api/drizzle' --exclude '.claude' --exclude '.pumori' "$ROOT" || rc=$?
+  return $rc
+}
+
+do_audit() { pnpm audit --prod --audit-level high; }
+
+run_security() {
+  security_step gitleaks gitleaks filter_gitleaks do_gitleaks || true
+  if command -v semgrep >/dev/null 2>&1; then
+    if ! run_step semgrep filter_semgrep do_semgrep; then
+      if grep -qiE 'failed to download|unable to (download|fetch)|connection(error| refused)|name resolution|network' "$LOG_DIR/semgrep.log"; then
+        FAILED=("${FAILED[@]/semgrep}"); echo "  (semgrep rules unavailable offline; treated as skipped)"
+      fi
+    fi
+  else
+    echo "- semgrep skipped (semgrep not installed)"
+  fi
+  if ! run_step audit filter_audit do_audit; then
+    if grep -qiE 'ERR_PNPM_AUDIT|ENOTFOUND|ECONNREFUSED|ETIMEDOUT|fetch failed' "$LOG_DIR/audit.log"; then
+      FAILED=("${FAILED[@]/audit}"); echo "  (registry audit endpoint unreachable; treated as skipped)"
+    fi
+  fi
+  # Drop empty entries left by the "treated as skipped" cases above.
+  local f kept=()
+  for f in ${FAILED[@]+"${FAILED[@]}"}; do [ -n "$f" ] && kept+=("$f"); done
+  FAILED=(${kept[@]+"${kept[@]}"})
+}
+
+# ---- main ----------------------------------------------------------------------------------
+step_install
+
+case "$MODE" in
+  quick)
+    run_step typecheck filter_tsc do_typecheck || stop_on_failure
+    run_step lint filter_eslint do_lint || stop_on_failure
+    ;;
+  tests)
+    run_step typecheck filter_tsc do_typecheck || stop_on_failure
+    run_step lint filter_eslint do_lint || stop_on_failure
+    if [ ${#VITEST_FILES[@]} -gt 0 ] || [ ${#RELATED_FILES[@]} -gt 0 ]; then run_step unit filter_vitest do_unit || stop_on_failure; fi
+    if [ ${#E2E_FILES[@]} -gt 0 ]; then run_step e2e filter_playwright do_e2e || stop_on_failure; fi
+    ;;
+  e2e)
+    run_step e2e filter_playwright do_e2e || true
+    ;;
+  security)
+    run_security
+    ;;
+  full)
+    run_step typecheck filter_tsc do_typecheck || true
+    run_step lint filter_eslint do_lint || true
+    run_step unit filter_vitest do_unit || true
+    run_step e2e filter_playwright do_e2e || true
+    run_security
+    ;;
+  release)
+    run_step typecheck filter_tsc do_typecheck || true
+    run_step lint filter_eslint do_lint || true
+    run_step unit filter_vitest do_unit || true
+    run_step e2e filter_playwright do_e2e || true
+    run_security
+    # Ephemeral ports shared by the build (rewrite target) and the production e2e run.
+    export E2E_API_PORT="${E2E_API_PORT:-$(free_port)}"
+    export E2E_WEB_PORT="${E2E_WEB_PORT:-$(free_port)}"
+    [ "$E2E_API_PORT" != "$E2E_WEB_PORT" ] || E2E_WEB_PORT="$(free_port)"
+    if run_step build filter_tail do_build; then
+      run_step e2e-prod filter_playwright do_e2e_prod || true
+    fi
+    ;;
+esac
+finish

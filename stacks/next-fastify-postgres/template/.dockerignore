@@ -1,0 +1,13 @@
+**/node_modules
+**/.next
+**/.next-e2e
+**/.next-release
+**/dist
+.git
+.env
+.env.*
+.run
+.verify
+test-results
+playwright-report
+.claude

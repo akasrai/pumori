@@ -1,0 +1,14 @@
+{
+  "name": "pumori",
+  "owner": {
+    "name": "akasrai"
+  },
+  "plugins": [
+    {
+      "name": "pumori",
+      "source": "./plugin",
+      "description": "Pumori software-factory team"
+    }
+  ],
+  "description": "Pumori, a PRD-to-product software-factory team for Claude Code"
+}

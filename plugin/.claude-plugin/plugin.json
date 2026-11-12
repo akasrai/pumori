@@ -1,0 +1,17 @@
+{
+  "name": "pumori",
+  "displayName": "Pumori",
+  "version": "0.7.0",
+  "description": "A software-factory team: submit a PRD and a PM, Designer, Architect, Test Designer, Developers, Reviewer, QA and Judge plan, build, test and iterate until the product works, then hand it over on staging.",
+  "author": {
+    "name": "akasrai"
+  },
+  "license": "MIT",
+  "keywords": [
+    "software-factory",
+    "agents",
+    "prd",
+    "qa",
+    "tdd"
+  ]
+}
