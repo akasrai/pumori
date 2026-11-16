@@ -1,7 +1,7 @@
 {
   "name": "pumori",
   "displayName": "Pumori",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "A software-factory team: submit a PRD and a PM, Designer, Architect, Test Designer, Developers, Reviewer, QA and Judge plan, build, test and iterate until the product works, then hand it over on staging.",
   "author": {
     "name": "akasrai"
