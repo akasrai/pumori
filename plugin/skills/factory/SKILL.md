@@ -231,13 +231,16 @@ concerns without stopping. `pumori commit-docs -m "plan: architecture and tasks"
 - `qa` → run `pumori qa-mark start <m>`, then the workflow `pumori:qa-milestone` with args `{"milestone": <m>, "criteria": <criteria>,
   "deferred": <deferred>, "lane": <lane>, "journeys": <journeys>, "visual_review": <true if `.pumori/design/chosen.md` exists>,
   "scenarios_dir": "<HOME>/pumori-home/scenarios/<project>", "qa_cycle": <n>, "judge_votes": 3,
-  "retest": <cycle 2+: ids of the bugs the fix tasks addressed>}` (project from `.pumori/run.json`; resolve `~` to an absolute path).
+  "retest": <retest>, "retest_carried": <retest_carried>}` (project from `.pumori/run.json`; resolve `~` to an absolute path;
+  `retest` and `retest_carried` exactly as `pumori next` gave them: the CLI tracks which fixes still need a look).
   **Then immediately call `pumori next` again**: while QA runs it returns the next milestone's `build` wave
   (dispatch it at once, alongside QA) or `wait` (end your turn until QA reports). Cycle 2+ is a retest of the
   fixed bugs only. When QA reports, run `pumori qa-mark end <m>`, then:
   - If there are bugs (critical/major always; minor if cheap), failed criteria, or unsatisfied journeys:
     spawn `pumori:architect` Mode: triage with the QA bug list, the judges' `problems` (symptoms only;
     never the journey text) and the Designer's **major** `design_issues` (minor ones go into known gaps unless cheap). It adds fix tasks with regression tests.
+    Small fixes are marked polish; `add-tasks` says where they went. Polish after a milestone passed QA doesn't
+    hold it open or cost a QA round, so don't start one for it: just follow `pumori next` (usually `close`).
   - Otherwise `pumori milestone-close <m>`. Tell the human: "Milestone M1 done: <goal>. Preview: <url>".
 - **Spec change needed** (triage says a QA, judge or security finding can only be fixed by changing the
   spec, e.g. "the outbox must be login-only"):

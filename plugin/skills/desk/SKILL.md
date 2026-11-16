@@ -59,7 +59,8 @@ milestone may be building at the same time; that's expected. When the workflow r
 `pumori qa-mark end <M>` first. Then:
 - If it found bugs, failed criteria or unsatisfied journeys: send the **architect desk** a triage request
   with the bug list and the judges' `problems` (symptoms only), and wait for its answer.
-- Send the orchestrator the summary: bugs by severity, journeys satisfied/total, and what the architect did.
+- Send the orchestrator the summary: bugs by severity, journeys satisfied/total, and what the architect did
+  (which fix tasks are polish and where `add-tasks` put them: polish after the milestone passed QA needs no new round).
 Answer challenge requests by starting `pumori:qa` with "Read-only critique: untestable or ambiguous
 REQs, missing unhappy paths and authz; no app, no edits; ranked list ≤8".
 

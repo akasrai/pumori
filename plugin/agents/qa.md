@@ -73,6 +73,8 @@ Finally `./init.sh stop` if you started the app.
   browser) already passed on integrated main, so don't repeat their happy paths step by step. Spend the
   time on what tests miss: the flow across screens as a real user, the 2–3 variations above, authz with two
   users, phone width, axe on new screens. One quick pass over each REQ's main example is enough.
+- **Small fixes from earlier milestones**: the prompt may list polish fixes merged since their milestone closed.
+  Give each one quick look (both widths if it's about layout); one that doesn't work is a bug of this milestone.
 - **Cycle 2+ (`Mode: retest`)**: re-check only the bugs listed in the prompt (each fixed by a task since the
   last cycle) plus a 3-minute smoke of the milestone's main flow. Don't re-walk every criterion, don't
   re-screenshot every screen. Record with `pumori record qa <M>` as usual (bugs still open stay in `bugs`).

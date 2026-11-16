@@ -13,7 +13,8 @@ export const meta = {
 }
 
 // args: { milestone, criteria: ["REQ-1"...], deferred: {"REQ-5": ["T7"]}, journeys: ["SC-0001"...], scenarios_dir: "/abs/path",
-//         qa_cycle: 1, judge_votes: 3, lane: "S", visual_review: true, retest: ["BUG-M1-2"], accounts: 3 }
+//         qa_cycle: 1, judge_votes: 3, lane: "S", visual_review: true, accounts: 3,
+//         retest: [{task, title, bugs}], retest_carried: [{task, title, bugs}] }   (both from `pumori next`)
 // cycle 2+ is a retest of the fixed bugs only (a full re-walk cost ~10 min per milestone in P3 v02)
 const M = args.milestone
 const LENSES = ['goal achieved: did the user get what they came for, end to end?',
@@ -37,14 +38,23 @@ work, not bugs: mention them in notes only.`
 
 phase('Criteria')
 const RETEST = (args.qa_cycle || 1) > 1
+const fixLine = i => typeof i === 'string' ? `- ${i}` : `- ${i.task}: ${i.title}${(i.bugs || []).length ? ` (${i.bugs.join(', ')})` : ''}`
+const fixes = (args.retest || []).map(fixLine).join('\n')
+// polish fixes from closed milestones, merged since: a quick look each, in this round instead of a round of their own
+const CARRIED = (args.retest_carried || []).length ? `
+Also re-check these small fixes from earlier milestones (already covered by their own tests; one quick look each, at
+1280 and 375 px where it is about layout). A fix that doesn't work is a bug of this milestone:
+${args.retest_carried.map(fixLine).join('\n')}` : ''
 const criteriaRun = RETEST
   ? agent(`Mode: retest. Milestone ${M}, QA cycle ${args.qa_cycle}. ${APP_NOTE}
-Re-check only the bugs from the previous cycle (.pumori/runtime/qa/${M}/cycle-${args.qa_cycle - 1}.json; their fix tasks are merged)
-${(args.retest || []).length ? `(${args.retest.join(', ')}) ` : ''}plus a 3-minute smoke of the milestone's main flow. Do not re-walk every criterion.
+Re-check only what these fix tasks (merged since the last QA round) were meant to fix; the bugs' details are in
+.pumori/runtime/qa/${M}/cycle-*.json and the tasks in .pumori/tasks.json:
+${fixes || `(none listed: the bugs of .pumori/runtime/qa/${M}/cycle-${args.qa_cycle - 1}.json)`}
+Then a 3-minute smoke of the milestone's main flow. Do not re-walk every criterion.${CARRIED}
 Record your report with pumori record qa ${M} and return it.`, { label: `qa:retest:${M}`, phase: 'Criteria', agentType: 'pumori:qa', schema: QA })
   : agent(`Mode: criteria. Milestone ${M}, QA cycle ${args.qa_cycle || 1}. ${APP_NOTE}
 Lane: ${args.lane || 'M'}. Requirements to check: ${(args.criteria || []).join(', ') || '(none: explore the built features briefly)'}.
-Deferred (still being built; NOT failures, do not test): ${JSON.stringify(args.deferred || {})}.
+Deferred (still being built; NOT failures, do not test): ${JSON.stringify(args.deferred || {})}.${CARRIED}
 Record your report with pumori record qa ${M} and return it.`, { label: `qa:criteria:${M}`, phase: 'Criteria', agentType: 'pumori:qa', schema: QA })
 
 // one test account per concurrent journey: judges sharing one account interfered with each other (sessions, banks)

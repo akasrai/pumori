@@ -809,7 +809,8 @@ def cmd_next(a):
                         **({"note": f"overlaps QA of {qa_busy}: run it alongside, do not wait"} if qa_busy else {})}, a.json)
         head = git(["rev-parse", "HEAD"], root).stdout.strip()
         # once QA has checked a milestone, later merges (the next milestone overlapping) don't force a re-check
-        if mst.get("checked_sha") != head and mst.get("qa") not in ("passed", "checked"):
+        # polish fixes merged after QA passed (`recheck`) get the browser check again, but no new QA round
+        if mst.get("checked_sha") != head and (mst.get("qa") not in ("passed", "checked") or mst.get("recheck")):
             return out({"action": "check", "milestone": m["id"],
                         "hint": f"run `pumori milestone-check {m['id']}` (browser suite of this milestone)"}, a.json)
         if mst.get("qa") == "checked" and not blocking_journeys(root):
@@ -819,9 +820,11 @@ def cmd_next(a):
                 return out({"action": "blocked", "milestone": m["id"],
                             "why": f"QA failed {mst['qa_cycles']} cycles; human decision needed"}, a.json)
             crit, deferred = qa_scope(root, m["id"])
+            retest, carried = retest_items(root, m["id"])
             return out({"action": "qa", "milestone": m["id"], "goal": m.get("goal"), "criteria": crit,
                         "deferred": deferred, "journeys": ready_journeys(root),
-                        "qa_cycle": mst["qa_cycles"] + 1, "lane": lane_of(root)[0]}, a.json)
+                        "qa_cycle": mst["qa_cycles"] + 1, "lane": lane_of(root)[0],
+                        "retest": retest, "retest_carried": carried}, a.json)
         return out({"action": "close", "milestone": m["id"]}, a.json)
     if qa_busy or build_busy:
         running = " and ".join(x for x in (f"QA of {qa_busy}" if qa_busy else "", f"the build of {build_busy}" if build_busy else "") if x)
@@ -832,6 +835,36 @@ def cmd_next(a):
 
 
 QA_RUNNING_MAX_S = 90 * 60
+SERIOUS = ("blocker", "major", "high", "critical")
+
+
+def qa_bug_severity(root):
+    """Severity of every bug QA has reported so far, by id."""
+    sev = {}
+    for f in sorted(glob.glob(str(rt(root) / "qa" / "*" / "cycle-*.json"))):
+        for b in load_json(f, {}).get("bugs", []):
+            if b.get("id"):
+                sev[b["id"]] = str(b.get("severity", "")).lower()
+    return sev
+
+
+def retest_items(root, mid):
+    """Fix tasks QA should re-check: merged since the last QA round, in this milestone (`retest`) or in
+    milestones already closed (`carried`, polish fixes added after their milestone passed)."""
+    st = state(root)
+    tasks = all_tasks(root)
+    done_ms = {k for k, v in st["milestones"].items() if v.get("status") == "done"}
+    retest, carried = [], []
+    for tid, t in tasks.items():
+        ts = st["tasks"].get(tid, {})
+        if t.get("origin") != "fix" or ts.get("status") != "passed" or ts.get("qa_retested"):
+            continue
+        item = {"task": tid, "title": t.get("title", ""), "bugs": t.get("bugs", [])}
+        if t["milestone"] == mid:
+            retest.append(item)
+        elif t["milestone"] in done_ms and t.get("polish"):  # other fixes held their milestone open for a retest
+            carried.append(item)
+    return retest, carried
 
 
 def qa_running(mst):
@@ -901,6 +934,8 @@ def cmd_qa_mark(a):
         mst = st["milestones"].setdefault(a.milestone, {"status": "todo", "qa_cycles": 0})
         if a.which == "start":
             mst["qa_running_since"] = now()
+            retest, carried = retest_items(root, a.milestone)
+            mst["qa_retest"] = [i["task"] for i in retest + carried]
         else:
             mst.pop("qa_running_since", None)
         save_state(root, st)
@@ -1002,6 +1037,7 @@ def milestone_check(a):
         mst = st2["milestones"].setdefault(a.milestone, {"status": "todo", "qa_cycles": 0})
         if ok:
             mst["checked_sha"] = head
+            mst.pop("recheck", None)
         save_state(root, st2)
     log(root, f"milestone {a.milestone} browser check {'PASS' if ok else 'FAIL: reopened ' + ','.join(reopened)}", "gate")
     print(json.dumps({"ok": ok, "results": results, "reopened": reopened}, indent=2))
@@ -1234,6 +1270,8 @@ def cmd_record(a):
             mst["last_qa"] = {"bugs": len(bugs), "serious": len(serious), "at": now()}
             data["verdict"] = f"{mst['qa']}: {len(bugs)} bugs ({len(serious)} serious), {len(data.get('criteria_failed') or [])} criteria failed"
             save_json(rt(root) / "qa" / ident / f"cycle-{mst['qa_cycles']}.json", {**data, "at": now()})
+            for tid in mst.pop("qa_retest", []):  # the fixes this round re-checked (snapshot at qa-mark start)
+                st["tasks"].setdefault(tid, {})["qa_retested"] = mst["qa_cycles"]
         elif kind == "judge":
             j = st["journeys"].setdefault(ident, {"votes": []})
             j["votes"].append({"satisfied": bool(data.get("satisfied")), "reason": data.get("reason", "")[:500],
@@ -1511,6 +1549,31 @@ def cmd_add_tasks(a):
     if not target:
         target = {"id": f"M{len(doc['milestones']) + 1}", "name": "Follow-ups", "goal": "Fix and change requests", "tasks": []}
         doc["milestones"].append(target)
+    sev = qa_bug_severity(root)
+    for t in new:
+        serious = [b for b in t.get("bugs", []) if sev.get(b) in SERIOUS]
+        if t.get("polish") and serious:
+            t.pop("polish")  # a fix for a major or critical bug is never polish
+            print(f"note: {t['id']} fixes {', '.join(serious)}, so it isn't polish", file=sys.stderr)
+        elif not t.get("polish") and t.get("bugs") and all(sev.get(b) in ("minor", "cosmetic") for b in t["bugs"]):
+            t["polish"] = True
+    st0 = state(root)
+    tst = st0["milestones"].get(target["id"], {})
+    passed_qa = tst.get("status") == "done" or tst.get("qa") in ("checked", "passed", "accepted")
+    polish = bool(new) and passed_qa and all(t.get("polish") for t in new)
+    moved_to = None
+    if polish:
+        # Paisa: M1 ran QA rounds 4-6 only to re-check a cosmetic card, a CSV BOM and an aria label. Polish found
+        # after a milestone passed QA goes into the next milestone that hasn't had QA yet, whose QA re-checks it;
+        # if there is none, it stays here and gets the browser check again, but no new QA round.
+        order = [m["id"] for m in doc["milestones"]]
+        later = order[order.index(target["id"]) + 1:] if target["id"] in order else []
+        nxt = next((mid2 for mid2 in later if st0["milestones"].get(mid2, {}).get("status") != "done"), None)
+        nst = st0["milestones"].get(nxt, {}) if nxt else {}
+        if nxt and not nst.get("qa_cycles") and not qa_running(nst):
+            moved_to = next(m for m in doc["milestones"] if m["id"] == nxt)
+            for t in new:
+                t["carried_from"] = target["id"]
     for t in new:
         if t.get("id") in existing:
             die(f"task id {t['id']} already exists")
@@ -1520,16 +1583,28 @@ def cmd_add_tasks(a):
         if t.get("feature_doc") and not (root / t["feature_doc"]).is_file():
             die(f"{t['id']}: feature_doc {t['feature_doc']} does not exist (write it first)")
         t.setdefault("origin", "fix")  # triage tasks don't count against the lane's planned-task cap
-        target["tasks"].append(t)
+        (moved_to or target)["tasks"].append(t)
     save_json(root / ".pumori" / "tasks.json", doc)
     with Locked(root):
         st = state(root)
         for t in new:
             st["tasks"].setdefault(t["id"], {"status": "todo", "rounds": 0, "history": []})
-        st["milestones"].setdefault(target["id"], {"status": "todo", "qa_cycles": 0})["qa"] = None
+        mst = st["milestones"].setdefault(target["id"], {"status": "todo", "qa_cycles": 0})
+        if not polish:
+            mst["qa"] = None
+        elif not moved_to:
+            mst["recheck"] = True
         save_state(root, st)
-    log(root, f"added tasks {[t['id'] for t in new]} to {target['id']}", "architect")
-    print(json.dumps({"ok": True, "milestone": target["id"], "added": [t["id"] for t in new]}))
+    ids = [t["id"] for t in new]
+    where = (moved_to or target)["id"]
+    if moved_to:
+        note = f"polish after {target['id']} passed QA: moved to {where}, whose QA re-checks it; {target['id']} can close now"
+    elif polish:
+        note = f"polish after {target['id']} passed QA: browser check again once merged, no new QA round"
+    else:
+        note = f"{target['id']} gets a QA retest once these merge"
+    log(root, f"added tasks {ids} to {where}" + (f" ({note})" if polish else ""), "architect")
+    print(json.dumps({"ok": True, "milestone": where, "added": ids, "polish": polish, "note": note}))
 
 
 def journeys(root):

@@ -73,7 +73,18 @@ so the orchestrator can apply it in one step (autopilot) or ask the human once. 
 reproduces the symptom (the Test Designer writes it). Describe the symptom and expected behaviour, never
 the hidden journey text. Pipe the JSON `{"milestone": "<id>", "tasks": [...]}` into `pumori add-tasks`.
 When a fix changes the design, update the affected feature doc in place (see Mode `change`) and set the fix
-task's `feature_doc`. Return a table: item → decision → task id.
+task's `feature_doc`. Put the bug ids a task fixes in its `"bugs"` list (QA bug ids, design issue ids, judge symptom ids).
+
+**Mark polish.** Set `"polish": true` on a fix task when everything it fixes is small: minor or cosmetic QA bugs,
+minor design issues, or problems noted by judges of journeys they were **satisfied** with. Never for failed
+criteria, critical or major bugs, unsatisfied journeys, authorization or data problems (`add-tasks` drops the flag
+on a task whose `bugs` include a major or critical one, and sets it on one whose `bugs` are all minor or cosmetic).
+Polish found after a milestone passed QA doesn't cost another QA round: `add-tasks` moves it to the next milestone
+that hasn't had QA yet, whose QA re-checks it, or, for the last milestone, keeps it and reruns only the browser
+check. Keep polish in its own tasks, apart from real fixes, so it can go this way (Paisa: M1's QA rounds 4–6
+re-checked only a card layout, a CSV BOM and an aria label).
+
+Return a table: item → decision → task id (polish or not).
 
 **Spec changes that alter a shared contract** (a response gains a field, a schema changes): add tasks in
 this order, with deps: (1) a contract task that changes the shared schema and the API, (2) only then, test
