@@ -39,13 +39,14 @@ tokens, and is the ONLY thing allowed to mark work as passing.
   pumori amend-test <task|baseline> --reason R       # commit a reviewed change to protected tests
   pumori release [--dry-run]                 # final checks, staging if Docker runs, generated HANDOFF.md, commit
   pumori trace [--json]                      # per requirement: tasks, tests, merge commits, journey results
+  pumori decide "<question>" --chose X [--reason R]  # (orchestrator) a minor choice made without stopping to ask
   pumori boot [stop]                          # start/stop the app for QA (production build when the stack has one)
   pumori bench-setup <P1|P2|P3> <label>      # benchmark project with fixed journeys + autopilot
   pumori bench-score [--label L]
   pumori hook <pretool|subagent-stop>         # Claude Code hook entry points (stdin JSON)
 """
 import argparse, collections, datetime as dt, fcntl, fnmatch, glob, hashlib, html, json, os, pathlib, re
-import shutil, socket, subprocess, sys, time
+import shutil, signal, socket, subprocess, sys, time
 
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[1]
 HOME = pathlib.Path(os.environ.get("PUMORI_HOME", pathlib.Path.home() / "pumori-home"))
@@ -142,8 +143,24 @@ def die(msg, code=1, as_json=False):
 
 
 def run(cmd, cwd=None, check=False, env=None, timeout=None):
-    p = subprocess.run(cmd, cwd=cwd, shell=isinstance(cmd, str), text=True, capture_output=True,
-                       env=env, timeout=timeout)
+    """Run a command and capture its output. On timeout, kill its whole process group (a shell's children,
+    such as a hung `docker build`, would otherwise keep running and hold the pipes open) and return exit
+    code 124 with a note, instead of raising."""
+    proc = subprocess.Popen(cmd, cwd=cwd, shell=isinstance(cmd, str), text=True, env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        p = subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+        try:
+            out, err = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+        p = subprocess.CompletedProcess(cmd, 124, out or "", (err or "") + f"\ntimed out after {timeout}s (stopped)")
     if check and p.returncode != 0:
         die(f"command failed: {cmd}\n{p.stdout}\n{p.stderr}")
     return p
@@ -1925,9 +1942,20 @@ def cmd_boot(a):
     root = repo_root()
     cmds = stack_cfg(root)["commands"]
     key = "stop" if a.action == "stop" else ("qa_boot" if "qa_boot" in cmds else "init")
+    boot_file = rt(root) / "boot.json"
     with Locked(root):  # the production build reads main; no merge may land mid-build
+        if key != "stop" and "stop" in cmds:
+            # always start fresh: a start command that sees the app already running keeps the OLD build
+            # (Paisa: QA retested a build from before the fixes and re-reported six fixed bugs)
+            run_stack(root, "stop", root, timeout=120)
+        head = git(["rev-parse", "--short", "HEAD"], root).stdout.strip()
         r = run_stack(root, key, root, timeout=900)
-    print(json.dumps({"ok": r["ok"], "command": cmds[key], "output": r["output"][-2500:]}, indent=2))
+    if key == "stop":
+        boot_file.unlink(missing_ok=True)
+    elif r["ok"]:
+        save_json(boot_file, {"commit": head, "at": now()})
+    print(json.dumps({"ok": r["ok"], "command": cmds[key], "commit": head if key != "stop" else None,
+                      "output": r["output"][-2500:]}, indent=2))
     sys.exit(0 if r["ok"] else 1)
 
 
@@ -2113,6 +2141,32 @@ def trace_markdown(rows):
     return L
 
 
+DECIDED_TAG = "(decided for you; reply to override)"
+
+
+def cmd_decide(a):
+    """Record a decision the orchestrator made without waiting for the human, so the run never stalls on a
+    minor question. It lands in decisions.md and in the handoff's 'Decisions made for you'."""
+    root = repo_root()
+    line = f"- {now()[:10]} Orchestrator {DECIDED_TAG}: {a.question.strip()} → **{a.chose.strip()}**"
+    if a.reason:
+        line += f". {a.reason.strip()}"
+    path = root / ".pumori" / "decisions.md"
+    with Locked(root):
+        text = path.read_text() if path.exists() else "# Decisions\n\n"
+        path.write_text(text.rstrip("\n") + "\n" + line + "\n")
+    log(root, f"DECIDED for the human: {a.question.strip()[:120]} -> {a.chose.strip()[:80]}", "orchestrator")
+    print(json.dumps({"ok": True, "recorded": line}))
+
+
+def decided_for_human(root):
+    path = root / ".pumori" / "decisions.md"
+    if not path.exists():
+        return []
+    return [l[2:].replace(f"Orchestrator {DECIDED_TAG}: ", "").strip()
+            for l in path.read_text().splitlines() if DECIDED_TAG in l]
+
+
 def cmd_trace(a):
     root = repo_root()
     rows = req_trace(root)
@@ -2139,7 +2193,7 @@ def cmd_release(a):
     docker = run(["docker", "info"], timeout=20).returncode == 0 if shutil.which("docker") else False
     staging = None
     if docker and "staging_up" in stack["commands"] and not a.dry_run:
-        r = run_stack(root, "staging_up", root, timeout=1800)
+        r = run_stack(root, "staging_up", root, timeout=900)  # optional: never let it hold the release
         staging = {"ok": r["ok"], "output": r["output"][-1200:]}
     ports = cfg.get("ports", {})
     fmt = lambda u: u.format(**{**ports, "STAGING_WEB_PORT": int(ports.get("WEB_PORT", 0) or 0) + 1000})
@@ -2161,7 +2215,9 @@ def cmd_release(a):
          "## Run it", ""]
     L += [f"- `{stack['commands'].get('init', './init.sh')}`: start locally"] + [f"- {k}: {u}" for k, u in urls.items()]
     if staging:
-        L.append(f"- Staging: {'up' if staging['ok'] else 'FAILED'} ({urls.get('staging_web', '')})")
+        L.append(f"- Staging: up ({urls.get('staging_web', '')})" if staging["ok"] else
+                 f"- Staging: didn't come up ({staging['output'].strip().splitlines()[-1][:160] if staging['output'].strip() else 'no output'}). "
+                 f"The release is complete without it; retry with `{stack['commands'].get('staging_up', './staging.sh up')}` once Docker works.")
     else:
         L.append("- Staging: skipped. Docker isn't running" + (" (dry run)" if a.dry_run else "") +
                  f"; start Docker Desktop, then `{stack['commands'].get('staging_up', './staging.sh up')}`.")
@@ -2184,6 +2240,11 @@ def cmd_release(a):
             still = [j for j in acc.get("journeys", []) if not st["journeys"].get(j, {}).get("satisfied")]
             gaps.append(f"{mid} closed by human decision with QA {acc.get('qa_was')}" +
                         (f"; journeys still unsatisfied: {', '.join(still)}" if still else "") + f" ({acc.get('reason')})")
+    mine = decided_for_human(root)
+    if mine:
+        L += ["", "## Decisions made for you", "",
+              "Minor choices the factory made instead of stopping to ask. Change any of them with `/pumori:change`.", ""]
+        L += [f"- {d}" for d in mine]
     L += ["", "## Cost by role", "", "| Role | Units | Share |", "|---|---|---|"] + \
         [f"| {r['role']} | {r['units'] / 1e6:.1f}M | {r['share']}% |" for r in cost_by_role(root)[:12]]
     L += ["", "## Known gaps", ""] + ([f"- {g}" for g in gaps] or ["- none recorded by QA"])
@@ -2437,6 +2498,7 @@ def main():
     s = sub.add_parser("amend-test"); s.add_argument("target"); s.add_argument("--reason", required=True)
     s = sub.add_parser("release"); s.add_argument("--dry-run", action="store_true")
     s = sub.add_parser("trace"); s.add_argument("--json", action="store_true")
+    s = sub.add_parser("decide"); s.add_argument("question"); s.add_argument("--chose", required=True); s.add_argument("--reason", default="")
     s = sub.add_parser("boot"); s.add_argument("action", nargs="?", default="start", choices=["start", "stop"])
     s = sub.add_parser("event"); s.add_argument("role"); s.add_argument("msg", nargs="+")
     s = sub.add_parser("roster"); s.add_argument("action", nargs="?", default="show", choices=["show", "set", "clear"])
@@ -2451,7 +2513,7 @@ def main():
           "handoff": cmd_handoff, "record": cmd_record, "gate": cmd_gate, "add-tasks": cmd_add_tasks,
           "journeys": cmd_journeys, "milestone-close": cmd_milestone_close, "milestone-accept": cmd_milestone_accept, "clean-dbs": cmd_clean_dbs, "cost": cmd_cost, "brand": cmd_brand, "flaky": cmd_flaky, "ready": cmd_ready, "qa-mark": cmd_qa_mark, "budget": cmd_budget,
           "status": cmd_status, "log": cmd_log, "event": cmd_event, "task": cmd_task, "lane": cmd_lane, "check-spec": cmd_check_spec,
-          "milestone-check": cmd_milestone_check, "resolve": cmd_resolve, "amend-test": cmd_amend_test, "boot": cmd_boot, "release": cmd_release, "trace": cmd_trace, "roster": cmd_roster, "bench-score": cmd_bench_score, "bench-setup": cmd_bench_setup,
+          "milestone-check": cmd_milestone_check, "resolve": cmd_resolve, "amend-test": cmd_amend_test, "boot": cmd_boot, "release": cmd_release, "trace": cmd_trace, "decide": cmd_decide, "roster": cmd_roster, "bench-score": cmd_bench_score, "bench-setup": cmd_bench_setup,
           "hook": cmd_hook}[a.cmd]
     fn(a)
 

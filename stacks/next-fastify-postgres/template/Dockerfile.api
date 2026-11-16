@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # API image: runs the TypeScript sources directly with Node 22 type stripping (no build step).
 FROM node:22-slim AS base
 ENV PNPM_HOME=/pnpm PATH=/pnpm:$PATH COREPACK_ENABLE_DOWNLOAD_PROMPT=0

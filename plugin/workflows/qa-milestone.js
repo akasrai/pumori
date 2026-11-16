@@ -20,7 +20,7 @@ const LENSES = ['goal achieved: did the user get what they came for, end to end?
   'data correctness: is what the user sees accurate, persisted and theirs only?',
   'experience: would this user be confused, blocked or annoyed at any step?']
 const VOTES = Math.min(args.judge_votes || 3, LENSES.length)
-const GATE = { type: 'object', properties: { ok: { type: 'boolean' }, output: { type: 'string' } }, required: ['ok'] }
+const GATE = { type: 'object', properties: { ok: { type: 'boolean' }, output: { type: 'string' }, commit: { type: 'string' } }, required: ['ok'] }
 const QA = { type: 'object', properties: { criteria_failed: { type: 'array', items: { type: 'object' } }, bugs: { type: 'array', items: { type: 'object' } }, screenshots: { type: 'array', items: { type: 'string' } }, notes: { type: 'string' } }, required: ['bugs'] }
 const RUN = { type: 'object', properties: { journey: { type: 'string' }, log: { type: 'string' }, completed_goal: { type: 'boolean' }, notes: { type: 'string' } }, required: ['journey', 'log'] }
 const VOTE = { type: 'object', properties: { satisfied: { type: 'boolean' }, reason: { type: 'string' }, user_visible_problems: { type: 'array', items: { type: 'string' } } }, required: ['satisfied', 'reason'] }
@@ -31,7 +31,9 @@ if (!boot?.ok) {
   return { milestone: M, boot_failed: true, output: boot?.output, bugs: [{ id: `BUG-${M}-BOOT`, title: 'App does not start', severity: 'critical', actual: boot?.output }] }
 }
 
-const APP_NOTE = 'The app is ALREADY RUNNING (production build, started by `pumori boot`; URLs in .env). Do not start or stop it.'
+const APP_NOTE = `The app is ALREADY RUNNING, freshly built from commit ${boot.commit || 'HEAD'} (production build, started by \`pumori boot\`; URLs in .env). Do not start or stop it.
+Pages and navigation links that belong to LATER milestones (the milestones after ${M} in .pumori/tasks.json) are planned
+work, not bugs: mention them in notes only.`
 
 phase('Criteria')
 const RETEST = (args.qa_cycle || 1) > 1

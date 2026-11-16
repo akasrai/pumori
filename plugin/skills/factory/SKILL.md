@@ -72,11 +72,19 @@ checkpoints, so an autopilot run started by the human in the app still uses sess
 as written, with role agents and workflows in the background. If any session start is refused, switch to
 agents mode for the rest of the run, tell the human in one line, and continue.
 
-**Decisions without the human.** Decide with your recommended option, log it with its reason in
-`.pumori/decisions.md`, tell the human in one line, and keep going. **Always ask, and wait for an answer, when:**
+**Decisions without the human.** Outside the two checkpoints, decide with your recommended option, record it with
+`pumori decide "<question>" --chose "<option>" --reason "<why>"` (it goes into `.pumori/decisions.md` and the
+handoff's "Decisions made for you"), tell the human in one line that they can override it by replying, and keep
+going. This covers wording, cosmetic and small UX choices, and picking between two reasonable behaviours the spec
+allows. **Never end your turn waiting on one of these.** If the human replies later with a different choice, send it
+to the Architect as a triage item. (Paisa: a question about a dialog's wording, asked at 1 am, held the whole run for
+11 hours; the human answered "keep as is".) **Always ask, and wait for an answer, only when:**
 - accepting a security or data-safety gap;
 - removing or cutting a feature from the spec;
 - anything that can't be undone, such as deleting data or deploying.
+
+Even then, only the work the question touches waits: before ending your turn, call `pumori next --json` (with
+`--building` while a build runs) and dispatch whatever it returns.
 
 **Budget:** the human sets the cap when starting the run or change request. Don't stop mid-run to ask for more;
 at the cap `pumori next` blocks, and that's the only budget stop.
@@ -288,6 +296,9 @@ concerns without stopping. `pumori commit-docs -m "plan: architecture and tasks"
   Docker is already running (it never starts Docker), generates `HANDOFF.md` from recorded facts
   (tasks, requirement coverage, journeys, risky files, known gaps, cost) and commits it. Add a 3–5 line
   plain-English summary at the top of your message to the human (not in the file). Then `pumori stage accept`.
+  **Staging is optional:** if it fails or times out, the release is still complete. Don't diagnose Docker or wait for
+  the human; say in one line that staging didn't come up and that `./staging.sh up` retries it once Docker works, and go
+  to accept. (Paisa: a hung Docker build, then a wait for the human, added 9 hours to the release.)
 
 ## accept (HUMAN CHECKPOINT 2)
 Summarise `HANDOFF.md` in ≤ 15 lines: staging URL, what works, journey results, the "review these first"

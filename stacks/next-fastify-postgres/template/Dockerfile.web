@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # Web image: Next.js standalone output. API_URL is baked into the /api/* rewrite at build time.
 FROM node:22-slim AS base
 ENV PNPM_HOME=/pnpm PATH=/pnpm:$PATH COREPACK_ENABLE_DOWNLOAD_PROMPT=0 NEXT_TELEMETRY_DISABLED=1
