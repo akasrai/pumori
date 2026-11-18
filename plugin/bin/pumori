@@ -34,6 +34,7 @@ tokens, and is the ONLY thing allowed to mark work as passing.
   pumori lane [S|M|L] [--json]               # size lane of this run (auto from PRD size) and its limits
   pumori check-spec [--json]                  # requirement count vs the lane's budget (PM runs it)
   pumori milestone-check <milestone>          # browser (e2e) suite of a built milestone; reopens failing tasks
+                                             #   (not when the app or browser fails to start: stage "environment")
   pumori resolve <task> retry|drop [--note N] # human/orchestrator way out of an escalation
   pumori record test-review <task|baseline> < json   # reviewer verdict on a proposed protected-test change
   pumori amend-test <task|baseline> --reason R       # commit a reviewed change to protected tests
@@ -968,6 +969,26 @@ def e2e_files(root, files):
     return [f for f in files if globs_match(f, globs)]
 
 
+# Failures that come from the test environment, not from a task's code: the app or browser never started.
+# First real project, in a change request: a framework upgrade notice stopped the e2e web server in the clean
+# checkout, every task's browser tests failed the same way, and the check reopened 37 finished tasks three times.
+ENV_FAILURE_SIGNS = [
+    r"webServer was not able to start", r"Timed out waiting \d+ms from config\.webServer",
+    r"EADDRINUSE", r"address already in use", r"ECONNREFUSED", r"net::ERR_CONNECTION_REFUSED",
+    r"Executable doesn't exist", r"browserType\.launch", r"Looks like Playwright .* just installed",
+    r"ERR_PNPM_", r"command not found", r"ENOSPC",
+]
+
+
+def env_failure_sign(output):
+    """The environment-failure line in a test run's output, or None if the failure looks like a real test failure."""
+    for line in output.splitlines():
+        for pat in ENV_FAILURE_SIGNS:
+            if re.search(pat, line):
+                return line.strip()[:300]
+    return None
+
+
 def cmd_milestone_check(a):
     """Run each built task's browser tests on integrated main; reopen the tasks whose tests fail.
     Holds the merge lock: with milestones overlapping, a merge must not change files mid-check."""
@@ -1011,26 +1032,54 @@ def milestone_check(a):
                                          for tid, t in tasks.items()
                                          if st["tasks"].get(tid, {}).get("status") == "passed"
                                          and t["milestone"] in upto]
+    failed, env_signs = [], []  # failed: (tid, output); env_signs: (tid, sign)
     for tid, files in groups:
         files = [f for f in files if (root / f).exists()]
         if not files:
             continue
         r = run_stack(root, "verify_tests", vwt, files)
         results.append({"task": tid, "ok": r["ok"], "seconds": r["seconds"]})
-        if not r["ok"] and tid != "baseline":
-            reopened.append(tid)
-            with Locked(root):
-                st2 = state(root)
-                ts = st2["tasks"][tid]
-                ts["status"] = "todo"
-                ts["rounds"] = 0
-                ts["instruction"] = ("Your merged task's browser tests fail on integrated main (another task's change "
-                                     "probably broke it, or it depended on something unmerged). Fix on a fresh branch "
-                                     "from main. Output:\n" + r["output"][-2000:])
-                ts.pop("worktree", None)
-                save_state(root, st2)
-        elif not r["ok"]:
-            results[-1]["output"] = r["output"][-2000:]
+        if r["ok"]:
+            continue
+        results[-1]["output"] = r["output"][-2000:]
+        failed.append((tid, r["output"]))
+        sign = env_failure_sign(r["output"])
+        if sign:
+            env_signs.append((tid, sign))
+        # the baseline failing to start, or two tasks failing to start, means the environment is broken:
+        # stop here (every further group would start the same broken server) and blame no task
+        if sign and (tid == "baseline" or len(env_signs) >= 2):
+            break
+    env_broken = any(t == "baseline" for t, _ in env_signs) or len(env_signs) >= 2
+    if env_broken:
+        sign = env_signs[0][1]
+        log(root, f"milestone {a.milestone} browser check: test environment broken ({sign[:120]}); no task reopened",
+            "gate")
+        print(json.dumps({"ok": False, "stage": "environment", "sign": sign,
+                          "failed_to_start": [t for t, _ in env_signs],
+                          "hint": "The browser tests could not run (the app or browser did not start), so no task was "
+                                  "reopened. It runs in a clean checkout of main: compare with the main checkout, fix "
+                                  "the environment or add one fixes_main task, then run milestone-check again.",
+                          "output": dict(failed)[env_signs[0][0]][-2500:],
+                          "results": results}, indent=2))
+        sys.exit(1)
+    for tid, output in failed:
+        if tid == "baseline":
+            continue
+        reopened.append(tid)
+        with Locked(root):
+            st2 = state(root)
+            ts = st2["tasks"][tid]
+            ts["status"] = "todo"
+            ts["rounds"] = 0
+            ts["instruction"] = ("Your merged task's browser tests fail on integrated main (another task's change "
+                                 "probably broke it, or it depended on something unmerged). Fix on a fresh branch "
+                                 "from main. Output:\n" + output[-2000:])
+            ts.pop("worktree", None)
+            save_state(root, st2)
+        for x in results:
+            if x["task"] == tid:
+                x.pop("output", None)
     ok = all(x["ok"] for x in results)
     with Locked(root):
         st2 = state(root)

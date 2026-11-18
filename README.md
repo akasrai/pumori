@@ -215,7 +215,7 @@ The team doesn't change.
 
 ## Status
 
-**v0.7.1.** Benchmarked on small PRDs and used to build a real mid-size internal app end to end, including two change
+**v0.7.2.** Benchmarked on small PRDs and used to build a real mid-size internal app end to end, including two change
 requests. The full history of what was measured and changed is in `IMPROVEMENTS.md`.
 
 Limits today:

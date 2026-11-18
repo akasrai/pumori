@@ -227,7 +227,11 @@ concerns without stopping. `pumori commit-docs -m "plan: architecture and tasks"
   re-run. Give the human a one-line progress update per wave (`T3 ✓ T4 ✓ T5 ↻`).
 - `check` → run `pumori milestone-check <m>` yourself (Bash; it runs the milestone's browser tests on
   integrated main). If it reopens tasks, `pumori next` returns them as a `build` wave whose
-  `conductor_instruction` holds the failure. Just continue the loop.
+  `conductor_instruction` holds the failure. Just continue the loop. If it returns `"stage": "environment"`,
+  the app or browser did not start (`sign` says how), so nothing was reopened: don't reset or rebuild tasks.
+  Check whether the same tests start in the main checkout. If it's something local (a stale process on the
+  port, a missing browser install), fix it and run the check again. If it's in the code or its dependencies
+  (a build or dev-server error), treat it as main-red: the Architect adds ONE `fixes_main` task.
 - `qa` → run `pumori qa-mark start <m>`, then the workflow `pumori:qa-milestone` with args `{"milestone": <m>, "criteria": <criteria>,
   "deferred": <deferred>, "lane": <lane>, "journeys": <journeys>, "visual_review": <true if `.pumori/design/chosen.md` exists>,
   "scenarios_dir": "<HOME>/pumori-home/scenarios/<project>", "qa_cycle": <n>, "judge_votes": 3,
