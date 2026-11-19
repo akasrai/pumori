@@ -195,7 +195,8 @@ pumori/
   plugin/                           the Claude Code plugin
     agents/  skills/  workflows/  hooks/hooks.json
     bin/pumori                      deterministic CLI (state, gates, budget, hooks)
-  stacks/next-fastify-postgres/     stack pack 1: template + stack.json contract
+  stacks/next-fastify-postgres/     stack pack 1: Next.js + Fastify (TypeScript) + Postgres
+  stacks/next-fastapi-postgres/     stack pack 2: Next.js + FastAPI (Python) + Postgres
   benchmarks/P1 P2 P3/              fixed PRDs + hidden journeys to measure the factory
 ~/pumori-projects/<name>/           products (git repos, main = integration branch)
 ~/pumori-home/scenarios/<name>/     hidden journeys (outside the product repo)
@@ -209,18 +210,24 @@ Make `stacks/<name>/` with `template/` and a `stack.json` that follows the same 
 - `init` and `verify` commands with `--quick`, `--tests`, `--e2e` and `--security` modes;
 - quiet output that shows only errors;
 - worktree-safe;
-- `test_globs`, `test_naming`, `skip_marker_regex`.
+- `test_globs`, `test_naming`, `skip_marker_regex`, `runnable_test_regex`;
+- optionally `broad_change_regex` (files whose change runs every test at the merge gate) and `risky_regex`
+  (files that get the stricter review), when the language's names differ from the defaults.
+
+`next-fastapi-postgres` shows a second language: a Python API behind the same web app, with Pydantic
+contracts generated into the web app's zod schemas.
 
 The team doesn't change.
 
 ## Status
 
-**v0.7.2.** Benchmarked on small PRDs and used to build a real mid-size internal app end to end, including two change
+**v0.8.0.** Benchmarked on small PRDs and used to build a real mid-size internal app end to end, including two change
 requests. The full history of what was measured and changed is in `IMPROVEMENTS.md`.
 
 Limits today:
-- one stack pack (Next.js + Fastify + Postgres); more stacks need new packs;
-- local Postgres and Node 22 on macOS or Linux;
+- two stack packs: Next.js + Fastify (TypeScript) and Next.js + FastAPI (Python), both on Postgres; the
+  Python pack is verified on a sample project but not yet benchmarked with a full factory run;
+- local Postgres and Node 22 (plus uv for the Python pack) on macOS or Linux;
 - the factory never deploys to production.
 
 ## License

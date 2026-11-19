@@ -1,0 +1,109 @@
+{
+  "name": "next-fastapi-postgres",
+  "description": "Next.js 16 (App Router) web + FastAPI (Python 3.13, uv) API + Postgres 16 via SQLAlchemy 2 and Alembic; Pydantic contracts generated into zod for the web, email/password session auth, pytest + Vitest + Playwright, single ./verify gate, Docker staging against host Postgres.",
+  "runtime": {
+    "node": "22",
+    "python": "3.13",
+    "path_prepend": [
+      "/opt/homebrew/opt/node@22/bin"
+    ]
+  },
+  "commands": {
+    "init": "./init.sh",
+    "stop": "./init.sh stop",
+    "status": "./init.sh status",
+    "verify": "./verify",
+    "verify_quick": "./verify --quick",
+    "verify_tests": "./verify --tests {files}",
+    "verify_e2e": "./verify --e2e",
+    "verify_security": "./verify --security",
+    "verify_release": "./verify --release",
+    "staging_up": "./staging.sh up",
+    "staging_down": "./staging.sh down",
+    "qa_boot": "./init.sh --prod",
+    "db_sweep": "uv run --project apps/api python apps/api/scripts/testdb.py sweep",
+    "db_sweep_all": "uv run --project apps/api python apps/api/scripts/testdb.py sweep --all"
+  },
+  "urls": {
+    "web": "http://localhost:{WEB_PORT}",
+    "api": "http://localhost:{API_PORT}",
+    "staging_web": "http://localhost:{STAGING_WEB_PORT}"
+  },
+  "test_globs": [
+    "apps/web/test/**",
+    "apps/api/tests/**",
+    "e2e/**",
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "**/*.spec.ts"
+  ],
+  "test_naming": {
+    "api": "apps/api/tests/test_{task}_{slug}.py",
+    "web": "apps/web/test/{task}-{slug}.test.tsx",
+    "e2e": "e2e/{task}-{slug}.spec.ts"
+  },
+  "skip_marker_regex": "\\b(it|test|describe)\\.(skip|only|todo|fixme)\\b|\\bx(it|describe)\\(|pytest\\.mark\\.(skip|skipif|xfail)|pytest\\.(skip|xfail)\\(|@unittest\\.skip",
+  "assert_regex": "\\bexpect\\(|\\bassert\\b|pytest\\.raises",
+  "placeholders": [
+    "PROJECT",
+    "DB_NAME",
+    "API_PORT",
+    "WEB_PORT",
+    "APP_NAME"
+  ],
+  "conventions_doc": "docs/conventions.md",
+  "design_doc": "docs/design.md",
+  "ui_gallery": "/dev/ui",
+  "e2e_globs": [
+    "e2e/**"
+  ],
+  "runnable_test_regex": "(\\.(test|spec)\\.[cm]?[jt]sx?|(^|/)test_[^/]*\\.py)$",
+  "areas": {
+    "contract": {
+      "label": "API contracts (Pydantic in apps/api/app/contracts + the generated packages/shared/src/generated.ts), DB models and Alembic migrations, component stubs",
+      "paths": [
+        "apps/api/app/contracts/**",
+        "packages/shared/**",
+        "apps/api/app/models.py",
+        "apps/api/migrations/**"
+      ]
+    },
+    "backend": {
+      "label": "FastAPI API (Python): routes, services, authorization, settings",
+      "paths": [
+        "apps/api/**"
+      ]
+    },
+    "frontend": {
+      "label": "Next.js web app: pages, components, design system (components/ui), shell, styles",
+      "paths": [
+        "apps/web/**"
+      ]
+    }
+  },
+  "coding_rules_doc": "docs/coding-rules.md",
+  "mockups_dir": "apps/web/app/dev/mockups",
+  "placeholder_files": [
+    "apps/web/lib/app-constants.ts"
+  ],
+  "test_support_globs": [
+    "e2e/support/**",
+    "apps/*/test/support/**",
+    "apps/api/tests/support/**"
+  ],
+  "verify_accepts_sources": true,
+  "designer_paths": [
+    "apps/web/app/dev/mockups/**",
+    "apps/web/components/dev/**",
+    "apps/web/app/theme.css",
+    "apps/web/app/fonts/**",
+    "apps/web/public/brand/**"
+  ],
+  "brand_targets": {
+    "theme": "apps/web/app/theme.css",
+    "fonts": "apps/web/app/fonts",
+    "logo": "apps/web/public/brand/logo.svg"
+  },
+  "broad_change_regex": "package\\.json$|pnpm-lock|tsconfig|\\.config\\.(ts|js|mjs|cjs)$|(^|/)test/setup\\.tsx?$|pyproject\\.toml$|uv\\.lock$|(^|/)conftest\\.py$|apps/api/app/settings\\.py$|apps/api/test_env\\.py$|apps/api/tests/helpers\\.py$|packages/shared/src/generated\\.ts$",
+  "risky_regex": "auth|session|password|login|signup|permission|admin|migrat|models\\.py|delete|payment|billing|money|invite|token|secret|settings\\.py"
+}

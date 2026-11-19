@@ -1,0 +1,17 @@
+**/node_modules
+**/.next
+**/.next-e2e
+**/.next-release
+**/dist
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+.git
+.env
+.env.*
+.run
+.verify
+test-results
+playwright-report
+.claude

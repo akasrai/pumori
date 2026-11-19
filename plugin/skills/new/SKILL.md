@@ -7,7 +7,8 @@ argument-hint: "<project-name> <path-to-prd.md> [stack]"
 Create a new Pumori project.
 
 1. Get from `$ARGUMENTS` or ask: project name (kebab-case), PRD path, stack (default
-   `next-fastify-postgres`; list available stacks with `ls` on the plugin's `stacks/` folder:
+   `next-fastify-postgres`, TypeScript throughout; `next-fastapi-postgres` for a Python (FastAPI) API with the
+   same Next.js web app; list available stacks with `ls` on the plugin's `stacks/` folder:
    `${CLAUDE_PLUGIN_ROOT}/../stacks` or `${CLAUDE_PLUGIN_ROOT}/stacks`). If the user pasted the PRD text
    instead of a path, save it to a temp `.md` file first.
 2. Run `pumori new <name> --prd <path> --stack <stack>` (add `--dir <path>` only if the user named a folder;

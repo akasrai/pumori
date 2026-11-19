@@ -46,6 +46,9 @@ the existing code (it is a working template with auth), `.pumori/spec/*.md`, `.p
        "test_files": ["apps/api/test/T1-lists-crud.test.ts", "e2e/T1-lists.spec.ts"],
        "feature_doc": "docs/features/lists.md", "deps": [], "size": "S|M"}]}]}
    ```
+   The paths above are the TypeScript stack's; use the stack's own: test files follow `test_naming` in
+   `.pumori/stack.json` (Python: `apps/api/tests/test_T1_lists.py`), and the conventions doc shows where a
+   resource's contract, model, routes and pages go.
    `feature_doc` names the one feature doc a task builds (lanes M and L; omit it for contract tasks that span
    features). The task's developers, test designer and reviewer read the core plus that file only.
    Planning rules (these decide whether the run succeeds):

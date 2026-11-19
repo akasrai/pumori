@@ -379,6 +379,7 @@ def cmd_new(a):
         die(f"{dest} already exists and is not empty")
     shutil.copytree(stack_dir / "template", dest, dirs_exist_ok=True,
                     ignore=shutil.ignore_patterns("node_modules", ".next", ".run", ".verify", "test-results",
+                                                  ".venv", "__pycache__", ".pytest_cache", ".ruff_cache",
                                                   "playwright-report", ".env"))
     h = int(hashlib.sha1(name.encode()).hexdigest(), 16)
     subs = {"PROJECT": name, "DB_NAME": "pumori_" + name.replace("-", "_"),
@@ -1412,7 +1413,8 @@ def test_guard(root, base, head, task):
 
 
 VERIFY_WT = ".claude/worktrees/pumori-verify"
-# only dependency/tooling changes need the whole suite; code changes run the tests that import them (vitest related)
+# only dependency/tooling changes need the whole suite; code changes run the tests that import them (vitest related).
+# A stack pack overrides it with "broad_change_regex" (Python: pyproject.toml, uv.lock, conftest.py, ...).
 BROAD_CHANGE_RE = r"package\.json$|pnpm-lock|tsconfig|\.config\.(ts|js|mjs|cjs)$|(^|/)env\.ts$|(^|/)test/setup\.tsx?$"
 
 
@@ -1512,7 +1514,8 @@ def cmd_gate(a):
         # lib, env, dependencies) still runs everything.
         changed = [n for st_, _, n in changed_files(root, before, head) if st_ != "D"]
         sources = []
-        if not any(re.search(BROAD_CHANGE_RE, f) for f in changed):
+        broad_re = stack_cfg(root).get("broad_change_regex", BROAD_CHANGE_RE)
+        if not any(re.search(broad_re, f) for f in changed):
             touched = set(changed)
             base_unit = [f for f in baseline_tests(root) if f not in set(e2e_files(root, baseline_tests(root)))]
             run_files = [f for f in run_files if f in t["test_files"] or f in base_unit or f in touched]
@@ -2330,7 +2333,8 @@ def cmd_release(a):
             gaps.append(f"{b.get('severity', '?')}: {b.get('title', '')}")
     base = git(["rev-list", "--max-parents=0", "HEAD"], root).stdout.split()[0]
     changed = git(["diff", "--name-only", base, "HEAD"], root).stdout.split()
-    risky = [f for f in changed if RISKY_RE.search(f) and not globs_match(f, stack.get("test_globs", []))]
+    risky_re = re.compile(stack["risky_regex"], re.I) if stack.get("risky_regex") else RISKY_RE
+    risky = [f for f in changed if risky_re.search(f) and not globs_match(f, stack.get("test_globs", []))]
     b = budget_info(root)
     rounds = sum(st["tasks"].get(t, {}).get("rounds", 0) for t in tasks)
     L = [f"# HANDOFF · {cfg.get('project')}", "",

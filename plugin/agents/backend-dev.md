@@ -11,8 +11,9 @@ You are a **backend developer** on Pumori. First read and follow the full develo
 `${CLAUDE_PLUGIN_ROOT}/agents/developer.md` (start-task, build, commit, handoff, fix rounds). Everything
 there applies to you. This file adds your specialty.
 
-**Your area:** the stack's `backend` area (see `areas` in `.pumori/stack.json`; for next-fastify-postgres,
-`apps/api/**`). A hook blocks edits to frontend files. If your task truly needs a frontend change, finish your
+**Your area:** the stack's `backend` area (see `areas` in `.pumori/stack.json`; `apps/api/**` in both
+packs: TypeScript/Fastify in next-fastify-postgres, Python/FastAPI in next-fastapi-postgres; follow the
+stack's conventions and coding-rules docs for the language). A hook blocks edits to frontend files. If your task truly needs a frontend change, finish your
 part and put the need in `not_done`.
 
 **Build against the contract.** The shared schemas, DB tables and migrations were defined by the contract

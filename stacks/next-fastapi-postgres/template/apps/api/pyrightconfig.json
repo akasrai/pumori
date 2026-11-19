@@ -1,0 +1,13 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.13",
+  "include": ["app", "tests", "scripts", "migrations", "test_env.py"],
+  "exclude": ["**/__pycache__", ".venv"],
+  "extraPaths": ["scripts", "tests"],
+  "typeCheckingMode": "standard",
+  "reportMissingImports": "error",
+  "reportUnnecessaryTypeIgnoreComment": "error",
+  "reportMissingParameterType": "error",
+  "reportUnknownParameterType": "none"
+}

@@ -34,9 +34,10 @@ findings and pushback.
 6. **Simplicity**: needless abstraction, dead code, duplication that will hurt soon.
 7. **Coding rules**: the stack's coding-rules doc (`coding_rules_doc` in `.pumori/stack.json`, e.g.
    `docs/coding-rules.md`). Lint already enforces the mechanical rules; you check the [review] ones (data
-   flow API→hooks→components, zod-parsing of inputs, handler check order, error shape, naming and file
-   suffixes, tests shipped with the feature), including the **data-safety rules**:
-   - DB CHECKs mirror zod rules for money and enums;
+   flow API→hooks→components, every input validated against the shared contract (zod or Pydantic, per the
+   stack), handler check order, error shape, naming and file suffixes, tests shipped with the feature),
+   including the **data-safety rules**:
+   - DB CHECKs mirror the contract's rules for money and enums;
    - consistent aggregates come from one snapshot;
    - "one active X" rules have a partial unique index;
    - money or invite creates are idempotent;

@@ -1,0 +1,78 @@
+# Started by ./staging.sh (which exports the variables below and creates the staging DB first).
+x-api-env: &api-env
+  APP_ENV: production
+  DATABASE_URL: postgres://${STAGING_DB_USER}@host.docker.internal:5432/${STAGING_DB_NAME}
+
+services:
+  # One-shot: applies pending migrations with the API image, then exits. The API starts only
+  # after it succeeds (same order as a production deploy: migrate, then roll out).
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    image: ${PROJECT}-staging-api
+    command: ["alembic", "-c", "alembic.ini", "upgrade", "head"]
+    environment:
+      <<: *api-env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    image: ${PROJECT}-staging-api
+    environment:
+      <<: *api-env
+      HOST: 0.0.0.0
+      API_PORT: "4000"
+      SESSION_SECRET: ${STAGING_SESSION_SECRET}
+      # Local staging is plain http, so Secure cookies would never be sent back. Production must
+      # serve https with COOKIE_SECURE=true; the API refuses to start in production otherwise
+      # unless this explicit escape hatch is set.
+      COOKIE_SECURE: "false"
+      ALLOW_INSECURE_COOKIES: "true"
+      # Browser traffic reaches the API through the web container's /api rewrite: trust that one hop
+      # so rate limits see the client IP. Never expose the API port publicly with this setting.
+      TRUST_PROXY: "1"
+      LOG_LEVEL: info
+      # Links in emails point at the staging web app.
+      WEB_ORIGIN: http://localhost:${STAGING_WEB_PORT}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${STAGING_API_PORT}:4000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:4000/readyz', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      args:
+        API_URL: http://api:4000
+    image: ${PROJECT}-staging-web
+    environment:
+      NODE_ENV: production
+      API_URL: http://api:4000
+      PORT: "3000"
+      HOSTNAME: 0.0.0.0
+    ports:
+      - "${STAGING_WEB_PORT}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/login').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
