@@ -297,7 +297,7 @@ def test_user_b_cannot_read_or_change_user_a_note() -> None:
 
 - pytest: `<DB_NAME>_t_<hash>`; Playwright: `<DB_NAME>_e_<hash>` (hash = 8 chars of the checkout path).
   Both are recreated from `<DB_NAME>_tpl` on every run, so tests start from an empty, migrated schema.
-- Tests within a run share the DB: create your own users/data (`unique_email()`), never assume empty tables.
+- Each test file starts on a fresh copy of the migrated DB, but tests within one file share it: create your own users/data (`unique_email()`), never assume empty tables, and never rely on rows another test file wrote.
 - New settings that API tests need go in `apps/api/test_env.py` (`tests/conftest.py` is protected).
 - e2e servers use free ports chosen by `./verify` (`E2E_API_PORT`, `E2E_WEB_PORT`) and Next's
   `.next-e2e` build dir, so they can run next to `./init.sh` and in parallel worktrees.

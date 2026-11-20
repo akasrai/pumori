@@ -7,6 +7,7 @@
 #   ./verify --tests <file>...   typecheck + lint + only these tests, all in parallel (e2e/*.spec.ts → Playwright,
 #                                apps/web/test/* → Vitest, apps/api/tests/test_*.py → pytest); a changed web source
 #                                file runs the Vitest tests that import it, a changed API .py file runs the API suite
+#                                (minus PUMORI_SKIP_TESTS: unbuilt tasks' red tests, set by the pumori CLI)
 #   ./verify --e2e               all Playwright tests
 #   ./verify --security          gitleaks + semgrep + pnpm audit (prod, high) + pip-audit (if installed)
 #   ./verify --release           full verify + production build (next build) + e2e against `next start`
@@ -48,7 +49,7 @@ case "${1:-}" in
       esac
     done
     ;;
-  -h | --help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h | --help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   *) die "unknown option: $1 (see ./verify --help)" ;;
 esac
 
@@ -190,9 +191,28 @@ filter_lint() { # eslint and ruff findings from one log
   printf '%s\n' "$text" | filter_ruff
 }
 
+pytest_skips() {
+  # PUMORI_SKIP_TESTS (set by the pumori CLI): committed tests of tasks not built yet, red on main by design.
+  # A whole-suite run skips them; a file named explicitly on the command line always runs.
+  [ -z "${PUMORI_SKIP_TESTS:-}" ] && return 0
+  local f
+  while IFS= read -r f; do
+    case "$f" in
+      apps/api/tests/*.py)
+        if [ ${#PYTEST_FILES[@]} -eq 0 ] || ! printf '%s\n' "${PYTEST_FILES[@]}" | grep -qxF "${f#apps/api/}"; then
+          printf -- '--ignore=%s\n' "${f#apps/api/}"
+        fi ;;
+    esac
+  done <<<"$PUMORI_SKIP_TESTS"
+}
+
 do_pytest() {
   # pytest runs from apps/api; conftest.py gives this checkout its own fresh test DB
-  (cd apps/api && NO_COLOR=1 $UV pytest -p no:randomly ${PYTEST_FILES[@]+"${PYTEST_FILES[@]}"})
+  local skips=()
+  if [ ${#PYTEST_FILES[@]} -eq 0 ]; then
+    while IFS= read -r s; do [ -n "$s" ] && skips+=("$s"); done < <(pytest_skips)
+  fi
+  (cd apps/api && NO_COLOR=1 $UV pytest -p no:randomly ${skips[@]+"${skips[@]}"} ${PYTEST_FILES[@]+"${PYTEST_FILES[@]}"})
 }
 
 do_unit() {

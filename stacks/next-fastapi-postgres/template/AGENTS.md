@@ -95,7 +95,7 @@ full logs are in `.verify/<step>.log`. It works in any git worktree: it uses the
   expression and the function is never called: the test can never pass). Prefer web-first assertions
   (`toHaveText`, `toHaveCSS`, `toBeVisible`) over `evaluate`.
 - API tests: `with api_client() as client:` + `sign_up(client)` from `apps/api/tests/helpers.py`, acting as a
-  user with `headers={"cookie": user.cookie}`; use `unique_email()` because tests share one DB. Every new
+  user with `headers={"cookie": user.cookie}`; use `unique_email()`: tests in one file share the DB (each file starts on a fresh copy, so never rely on another file's rows). Every new
   protected route gets a 401 test and an "user B cannot read/modify user A's resource → 404" test. Rate limits
   are off in the test env; `api_client(RATE_LIMIT_AUTH_MAX=2)` builds an app with setting overrides, and
   `production_settings()` gives a production config.

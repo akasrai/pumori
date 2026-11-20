@@ -296,12 +296,32 @@ def stack_env(root):
     return env
 
 
+def unbuilt_red_tests(root, keep=()):
+    """Committed test files of tasks not built yet: red on main by design. A stack whose verify runs a whole
+    suite for a changed source (pytest has no 'related tests') must skip them, or two tasks built in parallel
+    fail each other's gate (atlas T2/T3). Files the caller passes explicitly are never skipped."""
+    try:
+        st = state(root)
+        tasks = all_tasks(root)
+    except (Exception, SystemExit):  # no run state yet: nothing to skip
+        return []
+    keep = set(keep)
+    out = set()
+    for tid, t in tasks.items():
+        s = st["tasks"].get(tid, {})
+        if s.get("tests_committed") and s.get("status") not in ("passed", "dropped"):
+            out.update(f for f in t.get("test_files", []) if f not in keep)
+    return sorted(out)
+
+
 def run_stack(root, key, cwd, files=None, timeout=1800):
     cmd = stack_cfg(root)["commands"][key]
     if files is not None:
         cmd = cmd.replace("{files}", " ".join(f"'{f}'" for f in files))
+    env = stack_env(root)
+    env["PUMORI_SKIP_TESTS"] = "\n".join(unbuilt_red_tests(root, files or ()))
     t0 = time.time()
-    p = run(cmd, cwd=cwd, env=stack_env(root), timeout=timeout)
+    p = run(cmd, cwd=cwd, env=env, timeout=timeout)
     out = (p.stdout + ("\n" + p.stderr if p.stderr.strip() else "")).strip()
     lines = out.splitlines()
     return {"ok": p.returncode == 0, "seconds": round(time.time() - t0, 1),

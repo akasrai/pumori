@@ -51,5 +51,7 @@ Verified on macOS (Node 22, Python 3.13.2, uv 0.11, Postgres 16) on a project cr
 `./verify` full pass (typecheck, lint, 12 web unit tests, 39 API tests, Playwright e2e, gitleaks, semgrep,
 pnpm audit), `./init.sh` start/status/stop with sign-up through the web `/api` rewrite, and the
 `docs/conventions.md` notes example built end to end (contract → generated zod → migration → routes →
-authorization test). **Not yet exercised:** the Docker images and `staging.sh up`, pip-audit, and a full
-`/pumori:factory` run (the benchmark PRDs have not been run on this pack yet).
+authorization test). One full `/pumori:factory` run built a mid-size
+product on it (48 tasks, 3 milestones). That run led to two 0.8.1 fixes: each API test file starts on a fresh copy of
+the test DB, and a whole-suite run skips unbuilt tasks' red tests (`PUMORI_SKIP_TESTS`), so parallel backend tasks no
+longer fail each other's gate. **Not yet exercised:** the Docker images and `staging.sh up`, and pip-audit.

@@ -211,6 +211,8 @@ Make `stacks/<name>/` with `template/` and a `stack.json` that follows the same 
 - quiet output that shows only errors;
 - worktree-safe;
 - `test_globs`, `test_naming`, `skip_marker_regex`, `runnable_test_regex`;
+- `./verify` receives `PUMORI_SKIP_TESTS` (newline-separated test files of tasks not built yet). A stack that runs a whole
+  suite for a changed source must leave those files out, unless they were named on the command line;
 - optionally `broad_change_regex` (files whose change runs every test at the merge gate) and `risky_regex`
   (files that get the stricter review), when the language's names differ from the defaults.
 
@@ -221,7 +223,7 @@ The team doesn't change.
 
 ## Status
 
-**v0.8.0.** Benchmarked on small PRDs and used to build a real mid-size internal app end to end, including two change
+**v0.8.1.** Benchmarked on small PRDs and used to build a real mid-size internal app end to end, including two change
 requests. The full history of what was measured and changed is in `IMPROVEMENTS.md`.
 
 Limits today:

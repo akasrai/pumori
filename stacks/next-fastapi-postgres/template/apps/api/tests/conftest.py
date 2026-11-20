@@ -5,6 +5,8 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 API_DIR = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(API_DIR), str(API_DIR / "scripts")]
 
@@ -31,8 +33,22 @@ os.environ.update(
 )
 
 
+_fresh = True  # the DB made at session start is still untouched
+
+
 def pytest_sessionstart(session: object) -> None:
     testdb.prepare("t")
+
+
+@pytest.fixture(autouse=True, scope="module")
+def fresh_database_per_file() -> None:
+    """Each test file starts on a fresh copy of the migrated template, so rows one file commits (seeded
+    reference data it changes, a count it grows) never reach another file: the result can't depend on
+    which files ran first (atlas T5/T16/T20). Tests inside one file still share the database."""
+    global _fresh  # noqa: PLW0603
+    if not _fresh:
+        testdb.prepare("t")  # drops the old copy WITH (FORCE): leftover connections reconnect (pool_pre_ping)
+    _fresh = False
 
 
 def pytest_sessionfinish(session: object, exitstatus: int) -> None:
